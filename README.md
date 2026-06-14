@@ -28,8 +28,10 @@ c = einsum("ij, jk -> ik", a, b)        # runs on the NPU, returns an NPU tensor
   no longer need to fit entirely on-chip. The matmul tile size is configurable
   (`EINSUM_TILE_SIZE`, default 128) and Stage 1 requires the (fractal-padded)
   problem dims to divide evenly by the tile size — arbitrary tails are Stage 2.
-  Double buffering (Stage 1.5) is not yet implemented, so performance is below
-  vendor libraries.
+  The matmul K-loop is double-buffered (Stage 1.5).
+- **2D transpose** uses the `TTRANS` hardware tile op (`vnchwconv`) rather than a
+  scalar element copy — a large speedup on transposing equations. It is general
+  for `float32`/`float16`; large *unaligned* 2D transposes remain Stage 2.
 
 See [implementation.md](implementation.md) for the kernel-level details.
 

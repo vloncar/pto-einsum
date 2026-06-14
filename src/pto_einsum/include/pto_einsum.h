@@ -57,7 +57,8 @@ AICORE inline void SyncAll() {
 }
 
 // 1. Transpose Input/Output (Runs on Vector Core)
-// Uses element-by-element UB copy for 2D transpose, TLOAD/TSTORE for identity permutation.
+// Uses the TTRANS hardware tile transpose (vnchwconv) for 2D non-identity
+// permutations, and a TLOAD/TSTORE tiled copy for identity permutations.
 
 // Helper: constexpr check if permutation is identity
 template <typename CONFIG_T, unsigned D, bool InBounds>
@@ -115,120 +116,141 @@ AICORE inline void transpose_copy_inline(__gm__ const data_T* src, __gm__ data_T
     }
 }
 
+// Align `v` up to the next multiple of `m` (m a power-of-two factor of the dims
+// we care about), used to pad UB tile row-strides for the TTRANS hardware path.
+AICORE inline constexpr unsigned align_up(unsigned v, unsigned m) { return (v + m - 1) / m * m; }
+
+// 2D transpose using TTRANS — the Vector-core hardware transpose (vnchwconv).
+//
+// TTRANS is a tile op: it transposes a RowMajor src UB tile into a dst UB tile
+// using a scratch tmp UB tile, processing the rows in HW in 16-row sub-tiles and
+// handling a <16-row Y-remainder with a tiny library-internal scalar loop. It is
+// fully general over the valid extents (any validRow x validCol) for our b32/b16
+// dtypes — the only structural requirement is that the three tiles fit in UB, so
+// large tensors are still blocked. There is no more element-by-element scalar
+// transpose in this kernel.
+//
+// HW-path alignment is on the *UB tile row-strides* (which we choose), not on the
+// logical dims: TTRANS takes the HW path when srcStride % (32/sizeof) == 0 and
+// dstStride % 16 == 0, otherwise it falls back internally to a fully scalar
+// transpose. We therefore pad the tile widths so the HW path is always taken; the
+// logical dims themselves can be arbitrary.
 template <typename data_T, typename CONFIG_T>
 AICORE inline void transpose_2d_inline(__gm__ const data_T* src, __gm__ data_T* dst) {
     constexpr unsigned srcRows = CONFIG_T::from_shape[0];
     constexpr unsigned srcCols = CONFIG_T::from_shape[1];
-    constexpr unsigned total_elements = srcRows * srcCols;
 
-    // UB-bounded transpose. Both the whole-tensor and the blocked paths transpose
-    // by a scalar copy within UB; they differ only in how much of the tensor is
-    // resident at once. GM transfers must stay 32-byte aligned, which constrains
-    // the blocked path (see below).
-    constexpr unsigned UB_ELEM_BUDGET = (160u * 1024u) / sizeof(data_T);
+    // X sub-tile width for vnchwconv: 8 elems (fp32) / 16 elems (fp16).
+    constexpr unsigned blk = 32u / sizeof(data_T);
 
-    if constexpr (2 * total_elements <= UB_ELEM_BUDGET) {
-        // Whole tensor fits in UB: load all of src contiguously, transpose in UB,
-        // store all of dst contiguously. Both GM accesses are contiguous (aligned
-        // offsets), so arbitrary (even unaligned) dims are handled here.
-        constexpr unsigned TILE_COLS = 128;
-        using TileShape = pto::Shape<1, 1, 1, 1, TILE_COLS>;
-        using TileStride = pto::Stride<1, 1, 1, TILE_COLS, 1>;
-        using GlobalData = GlobalTensor<data_T, TileShape, TileStride>;
-        using TileData = Tile<TileType::Vec, data_T, 1, TILE_COLS, BLayout::RowMajor, -1, -1>;
-        using TileFull = Tile<TileType::Vec, data_T, 1, total_elements, BLayout::RowMajor, -1, -1>;
+    // Padded tile widths (= RowStride). srcTW is a multiple of blk so the src
+    // RowStride satisfies the HW path; dstTW/tmpTW are multiples of 16 (which is
+    // also 32-byte aligned for both fp32 and fp16) so the dst/tmp strides do too.
+    constexpr unsigned srcTW = align_up(srcCols, blk);
+    constexpr unsigned dstTW = align_up(srcRows, 16u);
+    constexpr unsigned tmpTW = dstTW;
 
-        TileFull srcUbFull(1, total_elements);
-        TileFull dstUbFull(1, total_elements);
-        constexpr unsigned dstOffsetBytes = total_elements * sizeof(data_T);
-        TASSIGN(srcUbFull, 0);
-        TASSIGN(dstUbFull, dstOffsetBytes);
+    constexpr unsigned srcBytes = srcRows * srcTW * sizeof(data_T);  // src tile (srcRows x srcTW)
+    constexpr unsigned dstBytes = srcCols * dstTW * sizeof(data_T);  // dst tile (srcCols x dstTW)
+    constexpr unsigned tmpBytes = srcCols * tmpTW * sizeof(data_T);  // tmp tile (srcCols x tmpTW)
 
-        TileData loadTile(1, TILE_COLS);
-        for (unsigned i = 0; i < total_elements; i += TILE_COLS) {
-            unsigned chunk = ((i + TILE_COLS) <= total_elements) ? TILE_COLS : (total_elements - i);
-            TASSIGN(loadTile, i * sizeof(data_T));
-            loadTile.SetValidRow(1);
-            loadTile.SetValidCol(chunk);
-            GlobalData srcGlobal(const_cast<__gm__ data_T*>(src + i));
-            TLOAD(loadTile, srcGlobal);
-        }
-        pipe_barrier(PIPE_ALL);  // MTE2 -> Scalar
+    // Leave headroom under the 192 KB UB; whole-tensor TTRANS needs all 3 tiles.
+    constexpr unsigned UB_BUDGET = 184u * 1024u;
 
-        for (unsigned r = 0; r < srcRows; ++r) {
-            for (unsigned c = 0; c < srcCols; ++c) {
-                dstUbFull.SetValue(c * srcRows + r, srcUbFull.GetValue(r * srcCols + c));
-            }
-        }
-        pipe_barrier(PIPE_ALL);  // Scalar -> MTE3
+    if constexpr (srcBytes + dstBytes + tmpBytes <= UB_BUDGET) {
+        // Whole tensor fits in UB: one TTRANS over the full srcRows x srcCols.
+        // Both GM transfers are a single (possibly strided) 2D move, so arbitrary
+        // (even unaligned) dims are handled here.
+        using SrcShape = pto::Shape<1, 1, 1, srcRows, srcCols>;
+        using SrcStride = pto::Stride<1, 1, 1, srcCols, 1>;
+        using DstShape = pto::Shape<1, 1, 1, srcCols, srcRows>;
+        using DstStride = pto::Stride<1, 1, 1, srcRows, 1>;
+        using SrcGlobal = GlobalTensor<data_T, SrcShape, SrcStride>;
+        using DstGlobal = GlobalTensor<data_T, DstShape, DstStride>;
 
-        TileData storeTile(1, TILE_COLS);
-        for (unsigned i = 0; i < total_elements; i += TILE_COLS) {
-            unsigned chunk = ((i + TILE_COLS) <= total_elements) ? TILE_COLS : (total_elements - i);
-            TASSIGN(storeTile, dstOffsetBytes + i * sizeof(data_T));
-            storeTile.SetValidRow(1);
-            storeTile.SetValidCol(chunk);
-            GlobalData dstGlobal(dst + i);
-            TSTORE(dstGlobal, storeTile);
-        }
+        using SrcTile = Tile<TileType::Vec, data_T, srcRows, srcTW, BLayout::RowMajor, -1, -1>;
+        using DstTile = Tile<TileType::Vec, data_T, srcCols, dstTW, BLayout::RowMajor, -1, -1>;
+        using TmpTile = Tile<TileType::Vec, data_T, srcCols, tmpTW, BLayout::RowMajor, -1, -1>;
+
+        SrcTile srcTile(srcRows, srcCols);
+        DstTile dstTile(srcCols, srcRows);
+        TmpTile tmpTile(srcCols, tmpTW);
+        TASSIGN(srcTile, 0);
+        TASSIGN(dstTile, srcBytes);
+        TASSIGN(tmpTile, srcBytes + dstBytes);
+
+        SrcGlobal srcGlobal(const_cast<__gm__ data_T*>(src));
+        DstGlobal dstGlobal(dst);
+
+        TLOAD(srcTile, srcGlobal);
+#ifndef __PTO_AUTO__
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+#endif
+        TTRANS(dstTile, srcTile, tmpTile);
+#ifndef __PTO_AUTO__
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+#endif
+        TSTORE(dstGlobal, dstTile);
         pipe_barrier(PIPE_ALL);
     } else {
-        // Too large for UB: transpose in BR x BC source blocks. Each block is
-        // loaded one source row at a time (contiguous), transposed by a scalar
-        // copy in UB, then stored one destination row at a time. The per-row GM
-        // offsets are r*srcCols and c*srcRows, so 16-aligned dims keep every
-        // transfer 32-byte aligned. Unaligned large tensors are a Stage 2 case.
+        // Too large for UB: TTRANS one BR x BC source block at a time. The block is
+        // loaded with a single strided 2D move, transposed in HW, and stored with a
+        // single strided 2D move. Each block's GM rows start at r*srcCols / c*srcRows,
+        // so 16-aligned dims keep every transfer 32-byte aligned (a GM-DMA constraint,
+        // not a TTRANS one). Unaligned large tensors are a Stage 2 case.
         static_assert(srcRows % 16 == 0 && srcCols % 16 == 0,
                       "Stage 1 blocked transpose requires 16-aligned dims for large tensors (tails are Stage 2).");
         constexpr unsigned BR = 64;
         constexpr unsigned BC = 64;
+        constexpr unsigned subSrcTW = align_up(BC, blk);   // src sub-tile width  (RowStride)
+        constexpr unsigned subDstTW = align_up(BR, 16u);   // dst/tmp sub-tile width (RowStride)
 
-        using RowShape = pto::Shape<1, 1, 1, 1, BC>;
-        using RowStride = pto::Stride<1, 1, 1, BC, 1>;
-        using RowGlobal = GlobalTensor<data_T, RowShape, RowStride>;
-        using RowTile = Tile<TileType::Vec, data_T, 1, BC, BLayout::RowMajor, -1, -1>;
+        using SrcShape = pto::Shape<1, 1, 1, BR, BC>;
+        using SrcStride = pto::Stride<1, 1, 1, srcCols, 1>;
+        using DstShape = pto::Shape<1, 1, 1, BC, BR>;
+        using DstStride = pto::Stride<1, 1, 1, srcRows, 1>;
+        using SrcGlobal = GlobalTensor<data_T, SrcShape, SrcStride>;
+        using DstGlobal = GlobalTensor<data_T, DstShape, DstStride>;
 
-        using BlockTile = Tile<TileType::Vec, data_T, 1, BR * BC, BLayout::RowMajor, -1, -1>;
-        BlockTile srcUb(1, BR * BC);
-        BlockTile dstUb(1, BR * BC);
-        constexpr unsigned dstOffsetBytes = BR * BC * sizeof(data_T);
-        TASSIGN(srcUb, 0);
-        TASSIGN(dstUb, dstOffsetBytes);
+        using SrcTile = Tile<TileType::Vec, data_T, BR, subSrcTW, BLayout::RowMajor, -1, -1>;
+        using DstTile = Tile<TileType::Vec, data_T, BC, subDstTW, BLayout::RowMajor, -1, -1>;
+        using TmpTile = Tile<TileType::Vec, data_T, BC, subDstTW, BLayout::RowMajor, -1, -1>;
 
-        RowTile rowTile(1, BC);
+        constexpr unsigned subSrcBytes = BR * subSrcTW * sizeof(data_T);
+        constexpr unsigned subDstBytes = BC * subDstTW * sizeof(data_T);
+        SrcTile srcTile(BR, BC);
+        DstTile dstTile(BC, BR);
+        TmpTile tmpTile(BC, subDstTW);
+        TASSIGN(srcTile, 0);
+        TASSIGN(dstTile, subSrcBytes);
+        TASSIGN(tmpTile, subSrcBytes + subDstBytes);
 
         for (unsigned r0 = 0; r0 < srcRows; r0 += BR) {
             unsigned rb = (srcRows - r0) < BR ? (srcRows - r0) : BR;
             for (unsigned c0 = 0; c0 < srcCols; c0 += BC) {
                 unsigned cb = (srcCols - c0) < BC ? (srcCols - c0) : BC;
 
-                // Load the rb x cb source block row-by-row into srcUb[rr*BC + cc].
-                for (unsigned rr = 0; rr < rb; rr++) {
-                    TASSIGN(rowTile, (rr * BC) * sizeof(data_T));
-                    rowTile.SetValidRow(1);
-                    rowTile.SetValidCol(cb);
-                    RowGlobal g(const_cast<__gm__ data_T*>(src + (r0 + rr) * srcCols + c0));
-                    TLOAD(rowTile, g);
-                }
-                pipe_barrier(PIPE_ALL);  // MTE2 -> Scalar
+                // Load the rb x cb source block, transpose to cb x rb, store it.
+                srcTile.SetValidRow(rb);
+                srcTile.SetValidCol(cb);
+                dstTile.SetValidRow(cb);
+                dstTile.SetValidCol(rb);
+                SrcGlobal sg(const_cast<__gm__ data_T*>(src + r0 * srcCols + c0));
+                DstGlobal dg(dst + c0 * srcRows + r0);
 
-                // Scalar transpose within UB: dstUb[cc*rb + rr] = srcUb[rr*BC + cc].
-                for (unsigned rr = 0; rr < rb; rr++) {
-                    for (unsigned cc = 0; cc < cb; cc++) {
-                        dstUb.SetValue(cc * rb + rr, srcUb.GetValue(rr * BC + cc));
-                    }
-                }
-                pipe_barrier(PIPE_ALL);  // Scalar -> MTE3
-
-                // Store the transposed cb x rb block row-by-row. dst is (srcCols x
-                // srcRows); output row (c0+cc) gets rb elements starting at col r0.
-                for (unsigned cc = 0; cc < cb; cc++) {
-                    TASSIGN(rowTile, dstOffsetBytes + (cc * rb) * sizeof(data_T));
-                    rowTile.SetValidRow(1);
-                    rowTile.SetValidCol(rb);
-                    RowGlobal g(dst + (c0 + cc) * srcRows + r0);
-                    TSTORE(g, rowTile);
-                }
+                TLOAD(srcTile, sg);
+#ifndef __PTO_AUTO__
+                set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+#endif
+                TTRANS(dstTile, srcTile, tmpTile);
+#ifndef __PTO_AUTO__
+                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+#endif
+                TSTORE(dg, dstTile);
                 pipe_barrier(PIPE_ALL);  // done with this block's UB before next load
             }
         }
@@ -325,59 +347,104 @@ __global__ AICORE void batched_matmul_kernel_standalone(__gm__ const data_T* ws0
             unsigned validM = (L0 - row0) < Mt ? (L0 - row0) : Mt;
             unsigned validN = (L1 - col0) < Nt ? (L1 - col0) : Nt;
 
-            MatTileA matA;
-            MatTileB matB;
+            // Stage 1.5 double buffering. The L1 Mat tiles are ping-ponged across
+            // two buffers so the GM->L1 load (MTE2, the slow stage) of the next K
+            // step overlaps the matmul (M) of the current step. The L0 Left/Right
+            // tiles stay single-buffered: a full Mt x Kt tile already fills L0A/L0B
+            // for the default tile, so two won't fit; the mov->matmul chain stays
+            // serialized but the expensive GM loads are hidden behind compute.
+            constexpr unsigned matBytesA = Mt * Kt * sizeof(data_T);
+            constexpr unsigned matBytesB = Kt * Nt * sizeof(data_T);
+            static_assert(2 * matBytesA + 2 * matBytesB <= 512u * 1024u,
+                          "Double-buffered L1 Mat tiles exceed the 512 KB CBUF.");
+
+            MatTileA matA[2];
+            MatTileB matB[2];
             LeftTileA leftA;
             RightTileB rightB;
             AccTileC accC;
 
-            TASSIGN(matA, 0x0);
-            TASSIGN(matB, 0x20000);
-            TASSIGN(leftA, 0x0);
-            TASSIGN(rightB, 0x0);
-            TASSIGN(accC, 0x0);
+            TASSIGN(matA[0], 0);
+            TASSIGN(matA[1], matBytesA);
+            TASSIGN(matB[0], 2 * matBytesA);
+            TASSIGN(matB[1], 2 * matBytesA + matBytesB);
+            TASSIGN(leftA, 0);
+            TASSIGN(rightB, 0);
+            TASSIGN(accC, 0);
 
             // Valid extents are constant across the K-loop, so set them once.
-            matA.SetValidRow(validM);  matA.SetValidCol(Kt);
-            matB.SetValidRow(Kt);      matB.SetValidCol(validN);
-            leftA.SetValidRow(validM); leftA.SetValidCol(Kt);
-            rightB.SetValidRow(Kt);    rightB.SetValidCol(validN);
-            accC.SetValidRow(validM);  accC.SetValidCol(validN);
+            matA[0].SetValidRow(validM); matA[0].SetValidCol(Kt);
+            matA[1].SetValidRow(validM); matA[1].SetValidCol(Kt);
+            matB[0].SetValidRow(Kt);     matB[0].SetValidCol(validN);
+            matB[1].SetValidRow(Kt);     matB[1].SetValidCol(validN);
+            leftA.SetValidRow(validM);   leftA.SetValidCol(Kt);
+            rightB.SetValidRow(Kt);      rightB.SetValidCol(validN);
+            accC.SetValidRow(validM);    accC.SetValidCol(validN);
             pipe_barrier(PIPE_ALL);  // PIPE_S: publish SetValid* before the tiles are used
 
+            // Event IDs (per L1 buffer where two can be in flight):
+            //   ID0/ID1  load-done   (MTE2 -> MTE1, RAW: mov waits its load)
+            //   ID2/ID3  matA free   (MTE1 -> MTE2, WAR: load waits prior mov)
+            //   ID4      mov-done    (MTE1 -> M,    RAW: matmul waits its mov)
+            //   ID5      leftA free  (M    -> MTE1, WAR: mov waits prior matmul)
             for (unsigned k = 0; k < nK; k++) {
+                unsigned p = k & 1;
+                event_t e_ld  = p ? EVENT_ID1 : EVENT_ID0;
+                event_t e_ldf = p ? EVENT_ID3 : EVENT_ID2;
                 unsigned k0 = k * Kt;
                 pto::GlobalTensor<data_T, ShapeA, StrideA> aGlobal(
                     const_cast<__gm__ data_T*>(ws0 + i * L0 * K + row0 * K + k0), ShapeA(validM));
                 pto::GlobalTensor<data_T, ShapeB, StrideB> bGlobal(
                     const_cast<__gm__ data_T*>(ws1 + i * K * L1 + k0 * L1 + col0), ShapeB(validN));
 
-                TLOAD(matA, aGlobal);
-                TLOAD(matB, bGlobal);
-
+                // Load GM -> L1 buffer p (wait until a prior mov freed this buffer).
 #ifndef __PTO_AUTO__
-                set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-                wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+                if (k >= 2) wait_flag(PIPE_MTE1, PIPE_MTE2, e_ldf);
 #endif
-                TMOV(leftA, matA);
-                TMOV(rightB, matB);
-
+                TLOAD(matA[p], aGlobal);
+                TLOAD(matB[p], bGlobal);
 #ifndef __PTO_AUTO__
-                set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-                wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+                set_flag(PIPE_MTE2, PIPE_MTE1, e_ld);
 #endif
-                // First Kt step initialises the accumulator; the rest accumulate.
+
+                // Move L1 -> L0 (single buffer): wait this load, and the prior matmul.
+#ifndef __PTO_AUTO__
+                wait_flag(PIPE_MTE2, PIPE_MTE1, e_ld);
+                if (k >= 1) wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
+#endif
+                TMOV(leftA, matA[p]);
+                TMOV(rightB, matB[p]);
+#ifndef __PTO_AUTO__
+                set_flag(PIPE_MTE1, PIPE_MTE2, e_ldf);    // matA[p] free to reload
+                set_flag(PIPE_MTE1, PIPE_M, EVENT_ID4);   // leftA/rightB ready
+#endif
+
+                // Matmul: first Kt step initialises the accumulator, the rest accumulate.
+#ifndef __PTO_AUTO__
+                wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID4);
+#endif
                 if (k == 0) {
                     TMATMUL(accC, leftA, rightB);
                 } else {
                     TMATMUL_ACC(accC, leftA, rightB);
                 }
-
-                // Stage 1 keeps a coarse barrier between K steps for correctness;
-                // Stage 1.5 will replace this with ping-pong (double-buffered) flags
-                // so the next load overlaps the current matmul.
-                pipe_barrier(PIPE_ALL);
+#ifndef __PTO_AUTO__
+                set_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);   // leftA/rightB free
+#endif
             }
+
+            // Drain the WAR-free flags the final step(s) set but nothing consumed,
+            // so no flag state leaks into the next output tile.
+#ifndef __PTO_AUTO__
+            if constexpr (nK >= 2) {
+                wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+                wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
+            } else {
+                wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+            }
+            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
+#endif
+            pipe_barrier(PIPE_ALL);
 
             pto::GlobalTensor<float, ShapeC, StrideC> cGlobal(
                 ws_res + i * L0 * L1 + row0 * L1 + col0, ShapeC(validM, validN));

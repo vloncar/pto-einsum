@@ -172,6 +172,13 @@ def run_tests():
         ((10, 20), (1, 0), torch.float32),
         ((8, 12), (1, 0), torch.float32),
         ((10, 24), (1, 0), torch.float16),
+
+        # 3. Large 2D transposes that exceed the UB budget (tests the blocked
+        #    TTRANS path; requires 16-aligned dims). 256x256 fp32 ~ 768 KB > UB.
+        ((256, 256), (1, 0), torch.float32),
+        ((256, 128), (1, 0), torch.float32),
+        ((128, 256), (1, 0), torch.float16),
+        ((512, 64), (1, 0), torch.float32),
     ]
     
     print("=========================================")

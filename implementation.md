@@ -71,16 +71,51 @@ paths:
 
 - **Identity permutation** → a straight tiled copy through the Unified Buffer
   (UB), 128 elements at a time. Handles arbitrary lengths.
-- **2D non-identity permutation** → a scalar transpose staged in UB. To keep UB
-  bounded this is a **hybrid**:
-  - *Whole-tensor* (fits the UB budget): load all of `src` contiguously,
-    transpose element-by-element in UB, store all of `dst` contiguously. Both GM
-    transfers are contiguous, so arbitrary (even unaligned) dims work.
-  - *Blocked* (too large for UB): transpose in `BR×BC` source blocks, loading
-    one source row at a time and storing one destination row at a time. The
-    per-row GM offsets are `r·srcCols` / `c·srcRows`, so this path requires
-    16-aligned dims to keep every transfer 32-byte aligned (a `static_assert`
-    enforces it; unaligned-large is Stage 2).
+- **2D non-identity permutation** → a **hardware** transpose via `TTRANS` (the
+  PTO `vnchwconv`-based tile op). `TTRANS(dst, src, tmp)` transposes a RowMajor
+  `src` UB tile into a `dst` UB tile using a scratch `tmp` tile; see below.
+
+#### `TTRANS` — hardware tile transpose
+
+`TTRANS` replaced the previous element-by-element scalar transpose (`SetValue`/
+`GetValue` per element), which was very slow on the Vector core. It is a
+**general** 2D transpose for our dtypes — no case-by-case fallback is needed at
+our level:
+
+- **Dtypes**: it supports b8/b16/b32; we use `float32` (b32) and `float16`
+  (b16). The transpose unit works on `[16,8]→[8,16]` (b32) / `[16,16]→[16,16]`
+  (b16) sub-tiles.
+- **Arbitrary valid extents**: any `validRow × validCol` is accepted. `TTRANS`
+  runs the rows in HW in 16-row sub-tiles and handles a `<16`-row Y-remainder
+  with a *tiny library-internal* scalar loop (at most 15 rows per tile). This is
+  the only residual scalar work and it lives inside the pto-isa library, not in
+  our kernel.
+- **Alignment is on the UB tile row-strides, not the logical dims**: `TTRANS`
+  takes the fast HW path only when `srcStride % (32/sizeof(T)) == 0` and
+  `dstStride % 16 == 0` (else it falls back internally to a fully scalar
+  transpose). Those strides are the *allocated tile widths*, which we control, so
+  we **pad** them — `srcTW = ⌈srcCols/blk⌉·blk` (`blk = 32/sizeof(T)`),
+  `dstTW = tmpTW = ⌈srcRows/16⌉·16` — guaranteeing the HW path for any logical
+  `srcRows × srcCols`.
+
+Because `TTRANS` is UB-resident (src + dst + tmp tiles must all fit in UB), the
+hybrid structure is kept, but each path now uses `TTRANS` for the transpose
+itself:
+
+  - *Whole-tensor* (the three padded tiles fit the ~184 KB UB budget): a single
+    `TLOAD → TTRANS → TSTORE`. Both GM transfers are one (possibly strided) 2D
+    move, so arbitrary (even unaligned) dims work — small odd-shaped tensors land
+    here.
+  - *Blocked* (too large for UB): `TTRANS` one `BR×BC` (64×64) block at a time,
+    each block a single strided `TLOAD → TTRANS → TSTORE`. The per-block GM rows
+    start at `r·srcCols` / `c·srcRows`, so this path still requires 16-aligned
+    dims to keep every transfer 32-byte aligned (a **GM-DMA** constraint, not a
+    `TTRANS` one; a `static_assert` enforces it, unaligned-large is Stage 2).
+
+So the cases are: (1) any tensor that fits UB → fully general hardware transpose;
+(2) large 16-aligned tensors → blocked hardware transpose; (3) large *unaligned*
+tensors → not yet supported (Stage 2, blocked by the GM-DMA alignment, not by
+`TTRANS`).
 
 ### Phase 2 — Cube-core tiled matmul
 
