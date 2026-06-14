@@ -1,0 +1,13 @@
+# Pinned dependencies for a known-good environment (Python 3.10, CANN 9.0.0).
+#
+# NOTE: torch_npu requires a matching CANN toolkit and Ascend driver on the host
+# and cannot be installed on a non-Ascend machine. torch is the CPU build that
+# torch_npu plugs into. See README.md for the full environment requirements.
+
+numpy==2.2.6
+torch==2.10.0
+torch_npu==2.10.0
+
+# Optional: benchmarking and tests
+matplotlib==3.10.9
+pytest==9.0.3

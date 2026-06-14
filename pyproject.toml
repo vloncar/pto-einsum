@@ -1,0 +1,7 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# Project metadata and packaging options are declared in setup.cfg (declarative
+# config). This keeps the package installable across a wide range of setuptools
+# versions, including older toolchains shipped inside CANN containers.

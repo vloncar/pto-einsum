@@ -1,0 +1,26 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# JIT build artifacts and compiled kernels
+build/
+tests/build_tpose/
+build_tpose/
+*.so
+*.o
+
+# Python caches / packaging
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.eggs/
+dist/
+
+# Benchmark output
+bench_results.png
+
+# Environment-specific / private (not part of the package)
+docker/
+extra-info/
