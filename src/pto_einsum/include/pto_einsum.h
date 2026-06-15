@@ -161,6 +161,51 @@ AICORE inline void padded_copy_inline(__gm__ const data_T* src, __gm__ data_T* d
     }
 }
 
+// Batched row-padded copy for an identity input1 feeding the Cube when the
+// contraction C is padded to K. The canonical input1 is a contiguous [I, C, L1]
+// stack (batch stride C*L1), but the Cube reads each batch as a [K, L1] block
+// (batch stride dstBatchStride = K*L1) with the K-C tail rows zero (pre-zeroed by
+// the caller). Each batch's C valid rows are copied to the front of its K-row
+// slot; a plain contiguous copy would mis-stride the batches. The I*C source rows
+// are distributed across the vector lanes.
+template <typename data_T>
+AICORE inline void batched_pad_copy_inline(__gm__ const data_T* src, __gm__ data_T* dst,
+                                           unsigned nbatch, unsigned rows, unsigned rowW,
+                                           unsigned dstBatchStride, unsigned lane, unsigned nlanes) {
+    constexpr unsigned TILE_COLS = 128;
+    using TileShape = pto::Shape<1, 1, 1, 1, TILE_COLS>;
+    using TileStride = pto::Stride<1, 1, 1, TILE_COLS, 1>;
+    using GlobalData = GlobalTensor<data_T, TileShape, TileStride>;
+    using TileData = Tile<TileType::Vec, data_T, 1, TILE_COLS, BLayout::RowMajor, -1, -1>;
+
+    TileData ubTile(1, TILE_COLS);
+    TASSIGN(ubTile, 0x0);
+
+    unsigned totalRows = nbatch * rows;
+    unsigned chunk = (totalRows + nlanes - 1) / nlanes;
+    unsigned g0 = lane * chunk;
+    unsigned g1 = (g0 + chunk) < totalRows ? (g0 + chunk) : totalRows;
+
+    for (unsigned g = g0; g < g1; g++) {
+        unsigned i = g / rows;       // batch
+        unsigned c = g - i * rows;   // row within the batch's C valid rows
+        for (unsigned col = 0; col < rowW; col += TILE_COLS) {
+            unsigned w = (col + TILE_COLS) <= rowW ? TILE_COLS : (rowW - col);
+            ubTile.SetValidRow(1);
+            ubTile.SetValidCol(w);
+            GlobalData sg(const_cast<__gm__ data_T*>(src + g * rowW + col));
+            GlobalData dg(dst + i * dstBatchStride + c * rowW + col);
+            TLOAD(ubTile, sg);
+#ifndef __PTO_AUTO__
+            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+#endif
+            TSTORE(dg, ubTile);
+            pipe_barrier(PIPE_ALL);
+        }
+    }
+}
+
 // Align `v` up to the next multiple of `m` (m a power-of-two factor of the dims
 // we care about), used to pad UB tile row-strides for the TTRANS hardware path.
 AICORE inline constexpr unsigned align_up(unsigned v, unsigned m) { return (v + m - 1) / m * m; }
@@ -647,16 +692,31 @@ __global__ AICORE void einsum_fused_kernel(
         set_mask_norm();
         set_vector_mask((uint64_t)-1, (uint64_t)-1);
 #endif
-        // input0's transpose output is [.., contract]; pad its innermost contract
-        // dim C up to the fractal width K so the Cube reads a full K-wide A. input1
-        // (contract is an outer dim) and the output need no padding — input1 just
-        // lands in a K-row-padded, pre-zeroed ws1 buffer.
         constexpr unsigned C = CONFIG_T::n_contract;
         constexpr unsigned K = (C + 15) / 16 * 16;
+        constexpr unsigned I = CONFIG_T::n_inplace;
+        constexpr unsigned L1 = CONFIG_T::n_free1;
         unsigned lane = get_block_idx() * 2 + get_subblockid();
         unsigned nlanes = get_block_num() * 2;
+
+        // input0's transpose output is [.., contract]; pad its innermost contract
+        // dim C up to the fractal width K so the Cube reads a full K-wide A. The
+        // pad is uniform across all I*L0 rows, so any batch count works directly.
         transpose_inline<data_T, typename CONFIG_T::tpose_inp0_config, C, K>(data0, ws0, lane, nlanes);
-        transpose_inline<data_T, typename CONFIG_T::tpose_inp1_config>(data1, ws1, lane, nlanes);
+
+        // input1's contract dim is the per-batch row count. For K==C, or a single
+        // batch, the K-C tail sits after the (one) valid block, so a plain
+        // transpose into the pre-zeroed ws1 suffices. For K!=C with batching, each
+        // batch's C valid rows must land at the front of its K-row slot (stride
+        // K*L1) — a contiguous write would mis-stride the batches — so repack with
+        // a per-batch K-row pad.
+        if constexpr (K != C && I > 1) {
+            static_assert(IsIdentityPerm<typename CONFIG_T::tpose_inp1_config>::value,
+                          "Batched K!=C fusion assumes an identity input1 permutation.");
+            batched_pad_copy_inline<data_T>(data1, ws1, I, C, L1, K * L1, lane, nlanes);
+        } else {
+            transpose_inline<data_T, typename CONFIG_T::tpose_inp1_config>(data1, ws1, lane, nlanes);
+        }
     }
 
     SyncAll<false>();  // inputs transposed -> matmul
@@ -674,11 +734,39 @@ __global__ AICORE void einsum_fused_kernel(
     }
 }
 
-// Host launcher for the fused kernel (single launch). Covers K==C (any batch) and
-// K!=C with no batch (I==1); the workspace is K-padded so the Cube reads a full
-// K-wide A / K-row B, and only the pad regions need zeroing.
+// Multi-launch einsum (4 separate kernels). No longer on the default dispatch
+// path — the fused kernel now covers every supported config — but retained as a
+// reference / debugging fallback. It host-pads the contraction via batched_matmul.
 template <typename data_T, typename CONFIG_T>
-void einsum_fused(const data_T* data0, const data_T* data1, float* res, void* stream) {
+void einsum_multilaunch(const data_T* data0, const data_T* data1, float* res, void* stream) {
+    size_t ws_size = sizeof(data_T) * CONFIG_T::tpose_inp0_config::N +
+                     sizeof(data_T) * CONFIG_T::tpose_inp1_config::N +
+                     sizeof(float) * CONFIG_T::tpose_out_conf::N;
+
+    void* workspace = nullptr;
+    aclrtMalloc(&workspace, ws_size, ACL_MEM_MALLOC_NORMAL_ONLY);
+
+    data_T* ws0 = reinterpret_cast<data_T*>(workspace);
+    data_T* ws1 = reinterpret_cast<data_T*>(ws0 + CONFIG_T::tpose_inp0_config::N);
+    float* ws_res = reinterpret_cast<float*>(ws1 + CONFIG_T::tpose_inp1_config::N);
+
+    transpose<data_T, typename CONFIG_T::tpose_inp0_config>(data0, ws0, stream);
+    transpose<data_T, typename CONFIG_T::tpose_inp1_config>(data1, ws1, stream);
+    batched_matmul<data_T, CONFIG_T>(ws0, ws1, ws_res, stream);
+    transpose<float, typename CONFIG_T::tpose_out_conf>(ws_res, res, stream);
+
+    aclrtSynchronizeStream(stream);
+    aclrtFree(workspace);
+}
+
+// The whole transpose -> matmul -> transpose pipeline runs as a single fused
+// mix-kernel launch (einsum_fused_kernel). Covers every supported config: K==C
+// (any batch) and K!=C (any batch, with the input transposes writing the K-padded
+// layout). The workspace is K-padded so the Cube reads a full K-wide A / K-row B,
+// and only the pad regions need zeroing.
+template <typename data_T, typename CONFIG_T>
+void einsum(const data_T data0[CONFIG_T::tpose_inp0_config::N], const data_T data1[CONFIG_T::tpose_inp1_config::N],
+            float res[CONFIG_T::tpose_out_conf::N], void* stream = nullptr) {
     int32_t device_id = 0;
     aclrtGetDevice(&device_id);
     int64_t core_num = 1;
@@ -720,47 +808,6 @@ void einsum_fused(const data_T* data0, const data_T* data1, float* res, void* st
 
     aclrtSynchronizeStream(stream);
     aclrtFree(workspace);
-}
-
-// Multi-launch einsum (4 kernels). Retained for the batched non-aligned case
-// (K!=C and I>1), where ws1 would need per-batch K-row padding that the fused
-// kernel's transpose destinations don't yet express; batched_matmul host-pads it.
-template <typename data_T, typename CONFIG_T>
-void einsum_multilaunch(const data_T* data0, const data_T* data1, float* res, void* stream) {
-    size_t ws_size = sizeof(data_T) * CONFIG_T::tpose_inp0_config::N +
-                     sizeof(data_T) * CONFIG_T::tpose_inp1_config::N +
-                     sizeof(float) * CONFIG_T::tpose_out_conf::N;
-
-    void* workspace = nullptr;
-    aclrtMalloc(&workspace, ws_size, ACL_MEM_MALLOC_NORMAL_ONLY);
-
-    data_T* ws0 = reinterpret_cast<data_T*>(workspace);
-    data_T* ws1 = reinterpret_cast<data_T*>(ws0 + CONFIG_T::tpose_inp0_config::N);
-    float* ws_res = reinterpret_cast<float*>(ws1 + CONFIG_T::tpose_inp1_config::N);
-
-    transpose<data_T, typename CONFIG_T::tpose_inp0_config>(data0, ws0, stream);
-    transpose<data_T, typename CONFIG_T::tpose_inp1_config>(data1, ws1, stream);
-    batched_matmul<data_T, CONFIG_T>(ws0, ws1, ws_res, stream);
-    transpose<float, typename CONFIG_T::tpose_out_conf>(ws_res, res, stream);
-
-    aclrtSynchronizeStream(stream);
-    aclrtFree(workspace);
-}
-
-template <typename data_T, typename CONFIG_T>
-void einsum(const data_T data0[CONFIG_T::tpose_inp0_config::N], const data_T data1[CONFIG_T::tpose_inp1_config::N],
-            float res[CONFIG_T::tpose_out_conf::N], void* stream = nullptr) {
-    constexpr unsigned C = CONFIG_T::n_contract;
-    constexpr unsigned K = (C + 15) / 16 * 16;
-    constexpr unsigned I = CONFIG_T::n_inplace;
-    // Fused single-kernel path covers K==C (any batch) and K!=C without batching
-    // (I==1). Batched non-aligned contraction (K!=C and I>1) still needs ws1's
-    // per-batch K-row padding, which the multi-launch path does host-side.
-    if constexpr (K == C || I == 1) {
-        einsum_fused<data_T, CONFIG_T>(data0, data1, res, stream);
-    } else {
-        einsum_multilaunch<data_T, CONFIG_T>(data0, data1, res, stream);
-    }
 }
 
 } // namespace pto_einsum

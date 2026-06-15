@@ -37,9 +37,8 @@ c = einsum("ij, jk -> ik", a, b)        # runs on the NPU, returns an NPU tensor
   mix-kernel launch (Cube + Vector cores cooperating, full cross-core barriers via
   FFTS) instead of four separate launches — removing launch overhead and host
   round-trips. Contraction padding for non-16-aligned `K` is written directly by
-  the transposes into a K-padded workspace (no mid-pipeline host copy/sync). The
-  fused path covers `K==C` (any batch) and `K!=C` without batching; batched
-  non-aligned contraction falls back to the multi-launch path.
+  the transposes into a K-padded workspace (no mid-pipeline host copy/sync),
+  covering `K==C` and `K!=C` for any batch count.
 
 See [IMPLEMENTATION.md](IMPLEMENTATION.md) for the kernel-level details.
 

@@ -83,18 +83,27 @@ kernel share one implementation.
 **Contraction padding without a host round-trip.** The Cube needs a `K`-wide
 operand A and `K`-row operand B (`K = ⌈C/16⌉·16`; the Left-operand partial-C0
 ND→NZ bug). The fused kernel allocates `ws0`/`ws1` K-padded, zeroes them once with
-`aclrtMemsetAsync` (only when `K != C`), and the **input0 transpose writes the
-padded layout directly**: its output's innermost (contract) dim is padded from `C`
-to `K` via a `DST_PAD` template arg (2D `TTRANS` path) or `padded_copy_inline`
-(identity path). `ws1` (contract is an outer dim) just lands in the larger
-pre-zeroed buffer. This removes the old mid-pipeline `malloc`/`memcpy`/stream-sync
-(a ~21× speedup on the degenerate outer-product case).
+`aclrtMemsetAsync` (only when `K != C`), and the **input transposes write the
+padded layout directly**:
 
-**Scope.** The fused path covers `K==C` (any batch) and `K!=C` without batching
-(`I==1`). Batched non-aligned contraction (`K!=C` and `I>1`) would need per-batch
-`K`-row padding of `ws1` that the transpose destinations don't yet express, so it
-falls back to the retained multi-launch path (`einsum_multilaunch`), which
-host-pads via `batched_matmul`.
+- `ws0` (`A`): the contract dim is innermost, so the input0 transpose pads it from
+  `C` to `K` per row via a `DST_PAD` template arg (2D `TTRANS` path) or
+  `padded_copy_inline` (identity path). The pad is uniform across all `I·L0` rows,
+  so any batch count works.
+- `ws1` (`B`): the contract dim is the per-batch *row* count. With a single batch
+  (or `K==C`) the one valid `[C, L1]` block sits at the front of the pre-zeroed
+  `[K, L1]` buffer, so a plain transpose suffices. With `K!=C` *and* batching, each
+  batch's `C` valid rows must land at the front of its `K`-row slot (batch stride
+  `K·L1`); a contiguous write would mis-stride the batches, so `batched_pad_copy_inline`
+  repacks them with a per-batch `K`-row pad.
+
+This removes the old mid-pipeline `malloc`/`memcpy`/stream-sync (a ~21× speedup on
+the degenerate outer-product case).
+
+**Scope.** The fused path covers every supported config: `K==C` and `K!=C`, each
+with any batch count. The multi-launch path (`einsum_multilaunch`, host-padding via
+`batched_matmul`) is retained only as a reference / debugging fallback and is no
+longer on the default dispatch.
 
 ### Phase 1 & 3 — Vector-core transpose
 
@@ -212,6 +221,3 @@ stale `.so` is reused and the change appears to have no effect.
   the matmul divisibility constraint.
 - Support unaligned large 2D transposes, removing the blocked-transpose 16-aligned
   constraint.
-- Fuse the batched non-aligned contraction case (`K != C` and `I > 1`), currently
-  served by the multi-launch fallback, by expressing per-batch `K`-row padding in
-  the transpose destinations.

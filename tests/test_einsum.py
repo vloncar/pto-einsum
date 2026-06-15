@@ -26,6 +26,9 @@ from pto_einsum import einsum, EinsumBuilder
     # a=20 -> K=32: 2D-TTRANS inputs (ai,ja).
     ("ij, jk -> ik", (32, 20), (20, 128)),
     ("ai, ja -> ij", (20, 16), (64, 20)),
+    # batched non-16-aligned contraction (K != C and I > 1): exercises the
+    # per-batch K-row repack of ws1 (batched_pad_copy_inline). j=20 -> K=32.
+    ("bij, bjk -> bik", (8, 16, 20), (8, 20, 64)),
 ])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_einsum_correctness(equation, shape0, shape1, dtype):
