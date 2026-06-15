@@ -113,11 +113,13 @@ AICORE inline void transpose_copy_inline(__gm__ const data_T* src, __gm__ data_T
 
         TLOAD(ubTile, srcGlobal);
 
-        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);   // RAW: store waits its load
         wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
 
         TSTORE(dstGlobal, ubTile);
-        pipe_barrier(PIPE_ALL);
+
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);   // WAR: next load reuses ubTile
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
     }
 }
 
@@ -152,11 +154,13 @@ AICORE inline void padded_copy_inline(__gm__ const data_T* src, __gm__ data_T* d
             GlobalData dg(dst + r * dstStride + c);
             TLOAD(ubTile, sg);
 
-            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);   // RAW: store waits its load
             wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
 
             TSTORE(dg, ubTile);
-            pipe_barrier(PIPE_ALL);
+
+            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);   // WAR: next load reuses ubTile
+            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
         }
     }
 }
@@ -197,11 +201,13 @@ AICORE inline void batched_pad_copy_inline(__gm__ const data_T* src, __gm__ data
             GlobalData dg(dst + i * dstBatchStride + c * rowW + col);
             TLOAD(ubTile, sg);
 
-            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);   // RAW: store waits its load
             wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
 
             TSTORE(dg, ubTile);
-            pipe_barrier(PIPE_ALL);
+
+            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);   // WAR: next load reuses ubTile
+            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
         }
     }
 }
@@ -280,16 +286,16 @@ AICORE inline void transpose_2d_inline(__gm__ const data_T* src, __gm__ data_T* 
 
         TLOAD(srcTile, srcGlobal);
 
-        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);   // RAW: transpose waits its load
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
         TTRANS(dstTile, srcTile, tmpTile);
 
-        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);   // RAW: store waits the transpose
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
 
         TSTORE(dstGlobal, dstTile);
-        pipe_barrier(PIPE_ALL);
+        pipe_barrier(PIPE_ALL);  // one-shot drain (single tile, no next iteration)
     } else {
         // Too large for UB: TTRANS one BR x BC source block at a time, each a single
         // strided 2D load -> HW transpose -> strided 2D store. Block GM rows start at
@@ -350,16 +356,23 @@ AICORE inline void transpose_2d_inline(__gm__ const data_T* src, __gm__ data_T* 
 
             TLOAD(srcTile, sg);
 
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);   // RAW: transpose waits its load
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
             TTRANS(dstTile, srcTile, tmpTile);
 
-            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);   // RAW: store waits the transpose
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
 
             TSTORE(dg, dstTile);
-            pipe_barrier(PIPE_ALL);  // done with this block's UB before next load
+
+            // WAR for the next block's reuse of the single src/dst/tmp UB tiles: the
+            // next load must not clobber srcTile before this transpose read it, and
+            // the next transpose must not clobber dst/tmp before this store read them.
+            set_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
+            set_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
+            wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
+            wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
         }
     }
 }
@@ -487,7 +500,6 @@ AICORE inline void batched_matmul_inline(__gm__ const data_T* ws0, __gm__ const 
             leftA.SetValidRow(validM);   leftA.SetValidCol(Kt);
             rightB.SetValidRow(Kt);      rightB.SetValidCol(validN);
             accC.SetValidRow(validM);    accC.SetValidCol(validN);
-            pipe_barrier(PIPE_ALL);  // PIPE_S: publish SetValid* before the tiles are used
 
             // Event IDs (per L1 buffer where two can be in flight):
             //   ID0/ID1  load-done   (MTE2 -> MTE1, RAW: mov waits its load)
@@ -513,7 +525,6 @@ AICORE inline void batched_matmul_inline(__gm__ const data_T* ws0, __gm__ const 
 
                 set_flag(PIPE_MTE2, PIPE_MTE1, e_ld);
 
-
                 // Move L1 -> L0 (single buffer): wait this load, and the prior matmul.
 
                 wait_flag(PIPE_MTE2, PIPE_MTE1, e_ld);
@@ -524,7 +535,6 @@ AICORE inline void batched_matmul_inline(__gm__ const data_T* ws0, __gm__ const 
 
                 set_flag(PIPE_MTE1, PIPE_MTE2, e_ldf);    // matA[p] free to reload
                 set_flag(PIPE_MTE1, PIPE_M, EVENT_ID4);   // leftA/rightB ready
-
 
                 // Matmul: first Kt step initialises the accumulator, the rest accumulate.
 
@@ -551,12 +561,15 @@ AICORE inline void batched_matmul_inline(__gm__ const data_T* ws0, __gm__ const 
             }
             wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
 
-            pipe_barrier(PIPE_ALL);
+            set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);   // RAW: the L0C store waits the matmul
+            wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
 
             pto::GlobalTensor<float, ShapeC, StrideC> cGlobal(
                 ws_res + i * L0 * L1 + row0 * L1 + col0, ShapeC(validM, validN));
             TSTORE(cGlobal, accC);
-            pipe_barrier(PIPE_ALL);
+
+            set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);   // WAR: next tile's matmul reuses accC (L0C)
+            wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
         }
 }
 

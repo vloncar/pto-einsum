@@ -29,6 +29,13 @@ from pto_einsum import einsum, EinsumBuilder
     # batched non-16-aligned contraction (K != C and I > 1): exercises the
     # per-batch K-row repack of ws1 (batched_pad_copy_inline). j=20 -> K=32.
     ("bij, bjk -> bik", (8, 16, 20), (8, 20, 64)),
+    # non-16-aligned *free* dims (identity layout, no transpose): the padded M/N
+    # exceed the real L0/L1, so the matmul emits partial output tiles whose
+    # dynamic SetValidRow/SetValidCol extents differ across tiles (e.g. M tiles
+    # 128 then 122). Exercises the dynamic-valid-extent path of the Cube matmul.
+    ("ij, jk -> ik", (250, 128), (128, 256)),   # partial M
+    ("ij, jk -> ik", (256, 128), (128, 250)),   # partial N
+    ("ij, jk -> ik", (250, 128), (128, 250)),   # both
 ])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_einsum_correctness(equation, shape0, shape1, dtype):
