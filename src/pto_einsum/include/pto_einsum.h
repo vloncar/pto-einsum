@@ -112,10 +112,10 @@ AICORE inline void transpose_copy_inline(__gm__ const data_T* src, __gm__ data_T
         GlobalData dstGlobal(dst + i);
 
         TLOAD(ubTile, srcGlobal);
-#ifndef __PTO_AUTO__
+
         set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-#endif
+
         TSTORE(dstGlobal, ubTile);
         pipe_barrier(PIPE_ALL);
     }
@@ -151,10 +151,10 @@ AICORE inline void padded_copy_inline(__gm__ const data_T* src, __gm__ data_T* d
             GlobalData sg(const_cast<__gm__ data_T*>(src + r * rowW + c));
             GlobalData dg(dst + r * dstStride + c);
             TLOAD(ubTile, sg);
-#ifndef __PTO_AUTO__
+
             set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-#endif
+
             TSTORE(dg, ubTile);
             pipe_barrier(PIPE_ALL);
         }
@@ -196,10 +196,10 @@ AICORE inline void batched_pad_copy_inline(__gm__ const data_T* src, __gm__ data
             GlobalData sg(const_cast<__gm__ data_T*>(src + g * rowW + col));
             GlobalData dg(dst + i * dstBatchStride + c * rowW + col);
             TLOAD(ubTile, sg);
-#ifndef __PTO_AUTO__
+
             set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-#endif
+
             TSTORE(dg, ubTile);
             pipe_barrier(PIPE_ALL);
         }
@@ -279,15 +279,15 @@ AICORE inline void transpose_2d_inline(__gm__ const data_T* src, __gm__ data_T* 
         DstGlobal dstGlobal(dst);
 
         TLOAD(srcTile, srcGlobal);
-#ifndef __PTO_AUTO__
+
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-#endif
+
         TTRANS(dstTile, srcTile, tmpTile);
-#ifndef __PTO_AUTO__
+
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-#endif
+
         TSTORE(dstGlobal, dstTile);
         pipe_barrier(PIPE_ALL);
     } else {
@@ -349,15 +349,15 @@ AICORE inline void transpose_2d_inline(__gm__ const data_T* src, __gm__ data_T* 
             DstGlobal dg(dst + c0 * dpad + r0);
 
             TLOAD(srcTile, sg);
-#ifndef __PTO_AUTO__
+
             set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-#endif
+
             TTRANS(dstTile, srcTile, tmpTile);
-#ifndef __PTO_AUTO__
+
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-#endif
+
             TSTORE(dg, dstTile);
             pipe_barrier(PIPE_ALL);  // done with this block's UB before next load
         }
@@ -505,44 +505,44 @@ AICORE inline void batched_matmul_inline(__gm__ const data_T* ws0, __gm__ const 
                     const_cast<__gm__ data_T*>(ws1 + i * K * L1 + k0 * L1 + col0), ShapeB(validN));
 
                 // Load GM -> L1 buffer p (wait until a prior mov freed this buffer).
-#ifndef __PTO_AUTO__
+
                 if (k >= 2) wait_flag(PIPE_MTE1, PIPE_MTE2, e_ldf);
-#endif
+
                 TLOAD(matA[p], aGlobal);
                 TLOAD(matB[p], bGlobal);
-#ifndef __PTO_AUTO__
+
                 set_flag(PIPE_MTE2, PIPE_MTE1, e_ld);
-#endif
+
 
                 // Move L1 -> L0 (single buffer): wait this load, and the prior matmul.
-#ifndef __PTO_AUTO__
+
                 wait_flag(PIPE_MTE2, PIPE_MTE1, e_ld);
                 if (k >= 1) wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
-#endif
+
                 TMOV(leftA, matA[p]);
                 TMOV(rightB, matB[p]);
-#ifndef __PTO_AUTO__
+
                 set_flag(PIPE_MTE1, PIPE_MTE2, e_ldf);    // matA[p] free to reload
                 set_flag(PIPE_MTE1, PIPE_M, EVENT_ID4);   // leftA/rightB ready
-#endif
+
 
                 // Matmul: first Kt step initialises the accumulator, the rest accumulate.
-#ifndef __PTO_AUTO__
+
                 wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID4);
-#endif
+
                 if (k == 0) {
                     TMATMUL(accC, leftA, rightB);
                 } else {
                     TMATMUL_ACC(accC, leftA, rightB);
                 }
-#ifndef __PTO_AUTO__
+
                 set_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);   // leftA/rightB free
-#endif
+
             }
 
             // Drain the WAR-free flags the final step(s) set but nothing consumed,
             // so no flag state leaks into the next output tile.
-#ifndef __PTO_AUTO__
+
             if constexpr (nK >= 2) {
                 wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
                 wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
@@ -550,7 +550,7 @@ AICORE inline void batched_matmul_inline(__gm__ const data_T* ws0, __gm__ const 
                 wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
             }
             wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
-#endif
+
             pipe_barrier(PIPE_ALL);
 
             pto::GlobalTensor<float, ShapeC, StrideC> cGlobal(
@@ -653,10 +653,10 @@ AICORE inline void transpose_inline(__gm__ const data_T* data, __gm__ data_T* re
 template <typename data_T, typename CONFIG_T>
 __global__ AICORE void transpose_kernel_standalone(__gm__ const data_T* data, __gm__ data_T* res) {
     if constexpr (DAV_VEC) {
-#ifndef __PTO_AUTO__
+
         set_mask_norm();
         set_vector_mask((uint64_t)-1, (uint64_t)-1);
-#endif
+
         transpose_inline<data_T, CONFIG_T>(data, res, get_block_idx(), get_block_num());
     }
 }
@@ -688,10 +688,10 @@ __global__ AICORE void einsum_fused_kernel(
     set_ffts_base_addr(ffts_addr);
 
     if constexpr (DAV_VEC) {
-#ifndef __PTO_AUTO__
+
         set_mask_norm();
         set_vector_mask((uint64_t)-1, (uint64_t)-1);
-#endif
+
         constexpr unsigned C = CONFIG_T::n_contract;
         constexpr unsigned K = (C + 15) / 16 * 16;
         constexpr unsigned I = CONFIG_T::n_inplace;
