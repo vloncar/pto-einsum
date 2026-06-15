@@ -24,16 +24,24 @@ c = einsum("ij, jk -> ik", a, b)        # runs on the NPU, returns an NPU tensor
 - Targets the **a2a3** architecture only.
 - Exactly **two** operands per equation.
 - Dtypes: `float32` and `float16` (NPU); `float32` on the CPU reference path.
-- Stage 1 **tiling**: the Cube matmul and the 2D transpose are tiled so problems
-  no longer need to fit entirely on-chip. The matmul tile size is configurable
-  (`EINSUM_TILE_SIZE`, default 128) and Stage 1 requires the (fractal-padded)
-  problem dims to divide evenly by the tile size — arbitrary tails are Stage 2.
-  The matmul K-loop is double-buffered (Stage 1.5).
+- **Tiling**: the Cube matmul and the 2D transpose are tiled so problems no longer
+  need to fit entirely on-chip. The matmul tile size is configurable
+  (`EINSUM_TILE_SIZE`, default 128); the (fractal-padded) problem dims must divide
+  evenly by the tile size (arbitrary tails are not yet supported). The matmul
+  K-loop is double-buffered.
 - **2D transpose** uses the `TTRANS` hardware tile op (`vnchwconv`) rather than a
   scalar element copy — a large speedup on transposing equations. It is general
-  for `float32`/`float16`; large *unaligned* 2D transposes remain Stage 2.
+  for `float32`/`float16`; large *unaligned* 2D transposes are not yet supported.
+  The blocked (large-tensor) transpose is distributed across all Vector cores.
+- **Single fused kernel.** The transpose → matmul → transpose pipeline runs in one
+  mix-kernel launch (Cube + Vector cores cooperating, full cross-core barriers via
+  FFTS) instead of four separate launches — removing launch overhead and host
+  round-trips. Contraction padding for non-16-aligned `K` is written directly by
+  the transposes into a K-padded workspace (no mid-pipeline host copy/sync). The
+  fused path covers `K==C` (any batch) and `K!=C` without batching; batched
+  non-aligned contraction falls back to the multi-launch path.
 
-See [implementation.md](implementation.md) for the kernel-level details.
+See [IMPLEMENTATION.md](IMPLEMENTATION.md) for the kernel-level details.
 
 ## Requirements
 
@@ -121,7 +129,7 @@ pto-einsum/
 │       └── cpu_einsum.h   # CPU reference kernels
 ├── tests/                 # pytest suites (einsum, split, transpose, python ref)
 ├── benchmarks/            # bench_einsum.py, debug_einsum.py
-├── implementation.md      # kernel design notes
+├── IMPLEMENTATION.md      # kernel design notes
 ├── pyproject.toml / setup.cfg / setup.py
 └── requirements.txt
 ```

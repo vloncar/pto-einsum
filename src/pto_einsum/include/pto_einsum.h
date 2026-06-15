@@ -22,6 +22,12 @@ constexpr bool DAV_CUBE = false;
 #endif
 #endif
 
+// FFTS control-address query used by the fused kernel's host launcher. We
+// forward-declare it instead of including <runtime/rt_ffts.h>, which drags in a
+// profiling header absent from some CANN toolkits. Provided by libruntime
+// (link -lruntime). The kernel-side set_ffts_base_addr comes from pto-inst.hpp.
+extern "C" int32_t rtGetC2cCtrlAddr(uint64_t* addr, uint32_t* len);
+
 namespace pto_einsum {
 
 // ─── SyncAll: full cross-core barrier ────────────────────────
@@ -56,11 +62,11 @@ AICORE inline void SyncAll() {
 #endif
 }
 
-// 1. Transpose Input/Output (Runs on Vector Core)
-// Uses the TTRANS hardware tile transpose (vnchwconv) for 2D non-identity
-// permutations, and a TLOAD/TSTORE tiled copy for identity permutations.
+// 1. Transpose input/output (Vector core). TTRANS hardware tile transpose
+// (vnchwconv) for 2D non-identity permutations; TLOAD/TSTORE tiled copy for
+// identity permutations.
 
-// Helper: constexpr check if permutation is identity
+// constexpr check: is the permutation the identity?
 template <typename CONFIG_T, unsigned D, bool InBounds>
 struct IsIdentityPermImpl;
 
@@ -82,12 +88,11 @@ struct IsIdentityPerm {
     static constexpr bool value = IsIdentityPermImpl<CONFIG_T, 0, (0 < CONFIG_T::dims)>::value;
 };
 
-// Identity copy: TLOAD from src → TSTORE to dst, tile by tile through UB
+// Identity copy: TLOAD src → TSTORE dst as flat 1D chunks through UB (src and
+// dst share the same layout). Caller distributes the [start, end) range.
 template <typename data_T, typename CONFIG_T>
 AICORE inline void transpose_copy_inline(__gm__ const data_T* src, __gm__ data_T* dst, unsigned start, unsigned end) {
-    // For identity permutations, src and dst have the same layout.
-    // Process in tiles that fit in UB. Use rows=1 so we work on flat 1D chunks.
-    constexpr unsigned TILE_COLS = 128;  // elements per tile row (safe for all dtypes, 32-byte aligned for fp16)
+    constexpr unsigned TILE_COLS = 128;  // elems/row; 32-byte aligned for fp16
     constexpr unsigned TILE_ROWS = 1;
 
     using TileShape = pto::Shape<1, 1, 1, TILE_ROWS, TILE_COLS>;
@@ -116,29 +121,71 @@ AICORE inline void transpose_copy_inline(__gm__ const data_T* src, __gm__ data_T
     }
 }
 
+// Row-padded copy for an identity-permutation input that feeds the Cube: the
+// contiguous [nrows, rowW] source is copied into a [nrows, dstStride] destination
+// (dstStride >= rowW; the pad columns rowW..dstStride are pre-zeroed by the
+// caller). Used by the fused kernel for the input0 transpose when the contraction
+// C is padded to K. Rows are distributed across the vector lanes.
+template <typename data_T>
+AICORE inline void padded_copy_inline(__gm__ const data_T* src, __gm__ data_T* dst,
+                                      unsigned nrows, unsigned rowW, unsigned dstStride,
+                                      unsigned lane, unsigned nlanes) {
+    constexpr unsigned TILE_COLS = 128;
+    using TileShape = pto::Shape<1, 1, 1, 1, TILE_COLS>;
+    using TileStride = pto::Stride<1, 1, 1, TILE_COLS, 1>;
+    using GlobalData = GlobalTensor<data_T, TileShape, TileStride>;
+    using TileData = Tile<TileType::Vec, data_T, 1, TILE_COLS, BLayout::RowMajor, -1, -1>;
+
+    TileData ubTile(1, TILE_COLS);
+    TASSIGN(ubTile, 0x0);
+
+    unsigned chunk = (nrows + nlanes - 1) / nlanes;
+    unsigned r0 = lane * chunk;
+    unsigned r1 = (r0 + chunk) < nrows ? (r0 + chunk) : nrows;
+
+    for (unsigned r = r0; r < r1; r++) {
+        for (unsigned c = 0; c < rowW; c += TILE_COLS) {
+            unsigned w = (c + TILE_COLS) <= rowW ? TILE_COLS : (rowW - c);
+            ubTile.SetValidRow(1);
+            ubTile.SetValidCol(w);
+            GlobalData sg(const_cast<__gm__ data_T*>(src + r * rowW + c));
+            GlobalData dg(dst + r * dstStride + c);
+            TLOAD(ubTile, sg);
+#ifndef __PTO_AUTO__
+            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+#endif
+            TSTORE(dg, ubTile);
+            pipe_barrier(PIPE_ALL);
+        }
+    }
+}
+
 // Align `v` up to the next multiple of `m` (m a power-of-two factor of the dims
 // we care about), used to pad UB tile row-strides for the TTRANS hardware path.
 AICORE inline constexpr unsigned align_up(unsigned v, unsigned m) { return (v + m - 1) / m * m; }
 
-// 2D transpose using TTRANS — the Vector-core hardware transpose (vnchwconv).
+// 2D transpose using the TTRANS hardware tile op (vnchwconv). TTRANS transposes
+// a RowMajor src UB tile into a dst UB tile via a scratch tmp tile; it is general
+// over the valid extents (any validRow x validCol) for our b32/b16 dtypes. The
+// only structural requirement is that the three tiles fit in UB, so large tensors
+// are blocked.
 //
-// TTRANS is a tile op: it transposes a RowMajor src UB tile into a dst UB tile
-// using a scratch tmp UB tile, processing the rows in HW in 16-row sub-tiles and
-// handling a <16-row Y-remainder with a tiny library-internal scalar loop. It is
-// fully general over the valid extents (any validRow x validCol) for our b32/b16
-// dtypes — the only structural requirement is that the three tiles fit in UB, so
-// large tensors are still blocked. There is no more element-by-element scalar
-// transpose in this kernel.
-//
-// HW-path alignment is on the *UB tile row-strides* (which we choose), not on the
-// logical dims: TTRANS takes the HW path when srcStride % (32/sizeof) == 0 and
-// dstStride % 16 == 0, otherwise it falls back internally to a fully scalar
-// transpose. We therefore pad the tile widths so the HW path is always taken; the
-// logical dims themselves can be arbitrary.
-template <typename data_T, typename CONFIG_T>
-AICORE inline void transpose_2d_inline(__gm__ const data_T* src, __gm__ data_T* dst) {
+// TTRANS takes its fast HW path only when srcStride % (32/sizeof) == 0 and
+// dstStride % 16 == 0 (else it falls back internally to a scalar transpose). The
+// strides are the *UB tile row-strides*, which we control, so we pad the tile
+// widths to always hit the HW path; the logical dims can be arbitrary.
+template <typename data_T, typename CONFIG_T, unsigned DST_PAD = 0>
+AICORE inline void transpose_2d_inline(__gm__ const data_T* src, __gm__ data_T* dst,
+                                       unsigned block_idx, unsigned block_num) {
     constexpr unsigned srcRows = CONFIG_T::from_shape[0];
     constexpr unsigned srcCols = CONFIG_T::from_shape[1];
+
+    // Destination innermost row stride. The transposed output is [srcCols, srcRows]
+    // with natural row stride srcRows; for an input0 transpose feeding the Cube the
+    // innermost (contract) dim is padded to DST_PAD >= srcRows (the pad columns are
+    // pre-zeroed by the caller). DST_PAD == 0 means "no padding" (standalone path).
+    constexpr unsigned dpad = (DST_PAD > srcRows) ? DST_PAD : srcRows;
 
     // X sub-tile width for vnchwconv: 8 elems (fp32) / 16 elems (fp16).
     constexpr unsigned blk = 32u / sizeof(data_T);
@@ -160,11 +207,15 @@ AICORE inline void transpose_2d_inline(__gm__ const data_T* src, __gm__ data_T* 
     if constexpr (srcBytes + dstBytes + tmpBytes <= UB_BUDGET) {
         // Whole tensor fits in UB: one TTRANS over the full srcRows x srcCols.
         // Both GM transfers are a single (possibly strided) 2D move, so arbitrary
-        // (even unaligned) dims are handled here.
+        // (even unaligned) dims work here. One tile == one unit of work, so only
+        // one core runs it; these tensors are small by definition.
+        if (block_idx != 0) {
+            return;
+        }
         using SrcShape = pto::Shape<1, 1, 1, srcRows, srcCols>;
         using SrcStride = pto::Stride<1, 1, 1, srcCols, 1>;
         using DstShape = pto::Shape<1, 1, 1, srcCols, srcRows>;
-        using DstStride = pto::Stride<1, 1, 1, srcRows, 1>;
+        using DstStride = pto::Stride<1, 1, 1, dpad, 1>;
         using SrcGlobal = GlobalTensor<data_T, SrcShape, SrcStride>;
         using DstGlobal = GlobalTensor<data_T, DstShape, DstStride>;
 
@@ -195,13 +246,13 @@ AICORE inline void transpose_2d_inline(__gm__ const data_T* src, __gm__ data_T* 
         TSTORE(dstGlobal, dstTile);
         pipe_barrier(PIPE_ALL);
     } else {
-        // Too large for UB: TTRANS one BR x BC source block at a time. The block is
-        // loaded with a single strided 2D move, transposed in HW, and stored with a
-        // single strided 2D move. Each block's GM rows start at r*srcCols / c*srcRows,
-        // so 16-aligned dims keep every transfer 32-byte aligned (a GM-DMA constraint,
-        // not a TTRANS one). Unaligned large tensors are a Stage 2 case.
+        // Too large for UB: TTRANS one BR x BC source block at a time, each a single
+        // strided 2D load -> HW transpose -> strided 2D store. Block GM rows start at
+        // r*srcCols / c*srcRows, so 16-aligned dims keep every transfer 32-byte
+        // aligned (a GM-DMA constraint, not a TTRANS one). Unaligned large tensors
+        // are not yet supported.
         static_assert(srcRows % 16 == 0 && srcCols % 16 == 0,
-                      "Stage 1 blocked transpose requires 16-aligned dims for large tensors (tails are Stage 2).");
+                      "Blocked transpose requires 16-aligned dims for large tensors.");
         constexpr unsigned BR = 64;
         constexpr unsigned BC = 64;
         constexpr unsigned subSrcTW = align_up(BC, blk);   // src sub-tile width  (RowStride)
@@ -210,7 +261,7 @@ AICORE inline void transpose_2d_inline(__gm__ const data_T* src, __gm__ data_T* 
         using SrcShape = pto::Shape<1, 1, 1, BR, BC>;
         using SrcStride = pto::Stride<1, 1, 1, srcCols, 1>;
         using DstShape = pto::Shape<1, 1, 1, BC, BR>;
-        using DstStride = pto::Stride<1, 1, 1, srcRows, 1>;
+        using DstStride = pto::Stride<1, 1, 1, dpad, 1>;
         using SrcGlobal = GlobalTensor<data_T, SrcShape, SrcStride>;
         using DstGlobal = GlobalTensor<data_T, DstShape, DstStride>;
 
@@ -227,60 +278,73 @@ AICORE inline void transpose_2d_inline(__gm__ const data_T* src, __gm__ data_T* 
         TASSIGN(dstTile, subSrcBytes);
         TASSIGN(tmpTile, subSrcBytes + subDstBytes);
 
-        for (unsigned r0 = 0; r0 < srcRows; r0 += BR) {
+        // The BR x BC source blocks are independent (each is a self-contained
+        // load -> TTRANS -> store), so the block grid is flattened into a 1D index
+        // space and block-distributed across the Vec cores, mirroring how the Cube
+        // matmul distributes its output-tile grid. Each core owns its own UB tiles.
+        constexpr unsigned nBR = (srcRows + BR - 1) / BR;
+        constexpr unsigned nBC = (srcCols + BC - 1) / BC;
+        constexpr unsigned nBlocks = nBR * nBC;
+        unsigned chunk = (nBlocks + block_num - 1) / block_num;
+        unsigned bstart = block_idx * chunk;
+        unsigned bend = (bstart + chunk) < nBlocks ? (bstart + chunk) : nBlocks;
+
+        for (unsigned b = bstart; b < bend; b++) {
+            unsigned r0 = (b / nBC) * BR;
+            unsigned c0 = (b % nBC) * BC;
             unsigned rb = (srcRows - r0) < BR ? (srcRows - r0) : BR;
-            for (unsigned c0 = 0; c0 < srcCols; c0 += BC) {
-                unsigned cb = (srcCols - c0) < BC ? (srcCols - c0) : BC;
+            unsigned cb = (srcCols - c0) < BC ? (srcCols - c0) : BC;
 
-                // Load the rb x cb source block, transpose to cb x rb, store it.
-                srcTile.SetValidRow(rb);
-                srcTile.SetValidCol(cb);
-                dstTile.SetValidRow(cb);
-                dstTile.SetValidCol(rb);
-                SrcGlobal sg(const_cast<__gm__ data_T*>(src + r0 * srcCols + c0));
-                DstGlobal dg(dst + c0 * srcRows + r0);
+            // Load the rb x cb source block, transpose to cb x rb, store it.
+            srcTile.SetValidRow(rb);
+            srcTile.SetValidCol(cb);
+            dstTile.SetValidRow(cb);
+            dstTile.SetValidCol(rb);
+            SrcGlobal sg(const_cast<__gm__ data_T*>(src + r0 * srcCols + c0));
+            DstGlobal dg(dst + c0 * dpad + r0);
 
-                TLOAD(srcTile, sg);
+            TLOAD(srcTile, sg);
 #ifndef __PTO_AUTO__
-                set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-                wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 #endif
-                TTRANS(dstTile, srcTile, tmpTile);
+            TTRANS(dstTile, srcTile, tmpTile);
 #ifndef __PTO_AUTO__
-                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
 #endif
-                TSTORE(dg, dstTile);
-                pipe_barrier(PIPE_ALL);  // done with this block's UB before next load
-            }
+            TSTORE(dg, dstTile);
+            pipe_barrier(PIPE_ALL);  // done with this block's UB before next load
         }
     }
 }
 
-// 2. Einsum Contraction (Standalone Cube Kernel)
+// 2. Einsum contraction (Cube core).
 //
-// Stage 1 tiling. The output C (per batch, L0 x L1) is partitioned into an
-// (Mt x Nt) tile grid over the *padded* dims M/N; the contraction is walked in
-// Kt-wide steps and accumulated on-chip (TMATMUL then TMATMUL_ACC). Each output
-// tile is one unit of work; all units across all batches are flattened into a
-// 1D index space and block-distributed across the AI cores.
+// The per-batch output (L0 x L1) is partitioned into an (Mt x Nt) tile grid over
+// the padded dims M/N; the contraction is walked in Kt-wide steps and accumulated
+// on-chip (TMATMUL then TMATMUL_ACC). Each output tile is one unit of work; all
+// tiles across all batches are flattened into a 1D index space and
+// block-distributed across the AI cores.
 //
 // Fractal alignment: the on-chip Mat/Left/Right/Acc tiles need multiples of 16
 // (NZ Mat InnerRows==16; Acc fractalCSize InnerRows==InnerCols==16). 16 is a
-// multiple of the C0 block (fp32=8, fp16=16), so InnerCols==C0 is satisfied too.
-// The tile sizes are therefore taken as min(config, padded-dim) and Stage 1
-// requires the padded dim to divide evenly (no partial tiles — that is Stage 2).
+// multiple of the C0 block (fp32=8, fp16=16), so InnerCols==C0 holds too. Tile
+// sizes are min(config, padded-dim), and the padded dim must divide evenly (no
+// partial tiles).
 //
-// The contraction is loaded full-Kt-wide (valid col == Kt): the host
-// (batched_matmul) guarantees the GM A/B buffers are K-wide and zero-padded, so
-// every Kt step has a full (>=C0) valid column count. This sidesteps the
-// Left-operand partial-C0 ND->NZ row-misplacement bug; the zero padding adds 0.
-// Only M (A rows / Acc rows) and N (B cols / Acc cols) carry a partial valid
-// extent on the boundary tile (because GM is L0xK / KxL1, not padded), which the
-// HW handles via SetValidRow/SetValidCol.
+// The contraction loads full-Kt-wide (valid col == Kt): the caller guarantees the
+// GM A/B buffers are K-wide and zero-padded, so every Kt step has a full (>=C0)
+// valid column count, sidestepping the Left-operand partial-C0 ND->NZ
+// row-misplacement bug (the zero padding adds 0). Only M (rows) and N (cols) carry
+// a partial valid extent on boundary tiles (GM is L0xK / KxL1, not padded),
+// handled via SetValidRow/SetValidCol.
+//
+// Factored out so the standalone kernel and the fused kernel share it; the caller
+// guards with `if constexpr (DAV_CUBE)` and supplies the block index/count.
 template <typename data_T, typename CONFIG_T>
-__global__ AICORE void batched_matmul_kernel_standalone(__gm__ const data_T* ws0, __gm__ const data_T* ws1, __gm__ float* ws_res) {
-    if constexpr (DAV_CUBE) {
+AICORE inline void batched_matmul_inline(__gm__ const data_T* ws0, __gm__ const data_T* ws1,
+                                         __gm__ float* ws_res, unsigned block_idx, unsigned block_num) {
         constexpr unsigned L0 = CONFIG_T::n_free0;
         constexpr unsigned L1 = CONFIG_T::n_free1;
         constexpr unsigned C = CONFIG_T::n_contract;
@@ -296,9 +360,9 @@ __global__ AICORE void batched_matmul_kernel_standalone(__gm__ const data_T* ws0
         constexpr unsigned Nt = CONFIG_T::tile_n < N ? CONFIG_T::tile_n : N;
         constexpr unsigned Kt = CONFIG_T::tile_k < K ? CONFIG_T::tile_k : K;
 
-        // Stage 1: full tile grid only (tails are Stage 2).
+        // Full tile grid only (no partial tiles).
         static_assert(M % Mt == 0 && N % Nt == 0 && K % Kt == 0,
-                      "Stage 1 tiling requires padded M/N/K divisible by the (clamped) tile size.");
+                      "Tiling requires padded M/N/K divisible by the (clamped) tile size.");
 
         constexpr unsigned nM = M / Mt;
         constexpr unsigned nN = N / Nt;
@@ -330,8 +394,6 @@ __global__ AICORE void batched_matmul_kernel_standalone(__gm__ const data_T* ws0
         using RightTileB = pto::TileRight<data_T, Kt, Nt, -1, -1>;
         using AccTileC = pto::TileAcc<float, Mt, Nt, -1, -1>;
 
-        unsigned block_idx = get_block_idx();
-        unsigned block_num = get_block_num();
         unsigned chunk = (total_tiles + block_num - 1) / block_num;
         unsigned start = block_idx * chunk;
         unsigned end = (start + chunk) < total_tiles ? (start + chunk) : total_tiles;
@@ -347,9 +409,9 @@ __global__ AICORE void batched_matmul_kernel_standalone(__gm__ const data_T* ws0
             unsigned validM = (L0 - row0) < Mt ? (L0 - row0) : Mt;
             unsigned validN = (L1 - col0) < Nt ? (L1 - col0) : Nt;
 
-            // Stage 1.5 double buffering. The L1 Mat tiles are ping-ponged across
-            // two buffers so the GM->L1 load (MTE2, the slow stage) of the next K
-            // step overlaps the matmul (M) of the current step. The L0 Left/Right
+            // Double buffering. The L1 Mat tiles are ping-ponged across two buffers
+            // so the GM->L1 load (MTE2, the slow stage) of the next K step overlaps
+            // the matmul (M) of the current step. The L0 Left/Right
             // tiles stay single-buffered: a full Mt x Kt tile already fills L0A/L0B
             // for the default tile, so two won't fit; the mov->matmul chain stays
             // serialized but the expensive GM loads are hidden behind compute.
@@ -451,6 +513,13 @@ __global__ AICORE void batched_matmul_kernel_standalone(__gm__ const data_T* ws0
             TSTORE(cGlobal, accC);
             pipe_barrier(PIPE_ALL);
         }
+}
+
+// Standalone Cube matmul kernel: thin wrapper over batched_matmul_inline.
+template <typename data_T, typename CONFIG_T>
+__global__ AICORE void batched_matmul_kernel_standalone(__gm__ const data_T* ws0, __gm__ const data_T* ws1, __gm__ float* ws_res) {
+    if constexpr (DAV_CUBE) {
+        batched_matmul_inline<data_T, CONFIG_T>(ws0, ws1, ws_res, get_block_idx(), get_block_num());
     }
 }
 
@@ -506,6 +575,36 @@ void batched_matmul(const data_T* ws0, const data_T* ws1, float* ws_res, void* s
     }
 }
 
+// Transpose dispatch body: identity -> tiled copy (chunked across lanes),
+// 2D non-identity -> TTRANS (block grid distributed across lanes). `lane`/`nlanes`
+// are the caller's vector-lane index/count: standalone pure-AIV launch passes
+// block_idx/block_num; the fused mix-kernel passes block_idx*2+subblockid over
+// block_num*2 sub-block lanes.
+// PAD_INNER/PAD_STRIDE pad the destination's innermost (contract) dim from
+// PAD_INNER to PAD_STRIDE (>= PAD_INNER) for an input0 transpose feeding the Cube;
+// the pad region is pre-zeroed by the caller. Both 0 (or equal) ⇒ no padding.
+template <typename data_T, typename CONFIG_T, unsigned PAD_INNER = 0, unsigned PAD_STRIDE = 0>
+AICORE inline void transpose_inline(__gm__ const data_T* data, __gm__ data_T* res,
+                                    unsigned lane, unsigned nlanes) {
+    if constexpr (IsIdentityPerm<CONFIG_T>::value) {
+        if constexpr (PAD_INNER > 0 && PAD_STRIDE > PAD_INNER) {
+            // Identity input feeding the Cube with a padded contract dim: copy the
+            // [N/PAD_INNER, PAD_INNER] rows into a PAD_STRIDE-wide destination.
+            padded_copy_inline<data_T>(data, res, CONFIG_T::N / PAD_INNER, PAD_INNER, PAD_STRIDE, lane, nlanes);
+        } else {
+            unsigned chunk = (CONFIG_T::N + nlanes - 1) / nlanes;
+            constexpr unsigned TILE_COLS = 128;
+            chunk = (chunk + TILE_COLS - 1) / TILE_COLS * TILE_COLS;
+            unsigned start = lane * chunk;
+            unsigned end = (start + chunk) < CONFIG_T::N ? (start + chunk) : CONFIG_T::N;
+            transpose_copy_inline<data_T, CONFIG_T>(data, res, start, end);
+        }
+    } else {
+        static_assert(CONFIG_T::dims == 2, "Non-identity transpose only supported for 2D");
+        transpose_2d_inline<data_T, CONFIG_T, PAD_STRIDE>(data, res, lane, nlanes);
+    }
+}
+
 template <typename data_T, typename CONFIG_T>
 __global__ AICORE void transpose_kernel_standalone(__gm__ const data_T* data, __gm__ data_T* res) {
     if constexpr (DAV_VEC) {
@@ -513,22 +612,7 @@ __global__ AICORE void transpose_kernel_standalone(__gm__ const data_T* data, __
         set_mask_norm();
         set_vector_mask((uint64_t)-1, (uint64_t)-1);
 #endif
-        unsigned block_idx = get_block_idx();
-        unsigned block_num = get_block_num();
-        unsigned chunk = (CONFIG_T::N + block_num - 1) / block_num;
-        constexpr unsigned TILE_COLS = 128;
-        chunk = (chunk + TILE_COLS - 1) / TILE_COLS * TILE_COLS;
-        unsigned start = block_idx * chunk;
-        unsigned end = (start + chunk) < CONFIG_T::N ? (start + chunk) : CONFIG_T::N;
-        
-        if constexpr (IsIdentityPerm<CONFIG_T>::value) {
-            transpose_copy_inline<data_T, CONFIG_T>(data, res, start, end);
-        } else {
-            static_assert(CONFIG_T::dims == 2, "Non-identity transpose only supported for 2D");
-            if (get_block_idx() == 0) {
-                transpose_2d_inline<data_T, CONFIG_T>(data, res);
-            }
-        }
+        transpose_inline<data_T, CONFIG_T>(data, res, get_block_idx(), get_block_num());
     }
 }
 
@@ -538,18 +622,115 @@ void transpose(const data_T* data, data_T* res, void* stream = nullptr) {
     aclrtGetDevice(&device_id);
     int64_t core_num = 1;
     aclrtGetDeviceInfo(device_id, ACL_DEV_ATTR_AICORE_CORE_NUM, &core_num);
-    
+
     transpose_kernel_standalone<data_T, CONFIG_T><<<core_num, nullptr, stream>>>(data, res);
 }
 
+// ─── Fused single-kernel einsum ──────────────────────────────────────────────
+// One mix-kernel launch (AIC + AIV) runs the whole pipeline, with full
+// cross-core barriers between phases:
+//   [Vec ]  Phase A: transpose data0->ws0, data1->ws1
+//   -- SyncAll<false>() --   Vec -> Cube
+//   [Cube]  Phase B: ws0 @ ws1 -> ws_res
+//   -- SyncAll<false>() --   Cube -> Vec
+//   [Vec ]  Phase C: transpose ws_res->res
+// Vec distributes work over block_num*2 sub-block lanes; Cube over block_num.
 template <typename data_T, typename CONFIG_T>
-void einsum(const data_T data0[CONFIG_T::tpose_inp0_config::N], const data_T data1[CONFIG_T::tpose_inp1_config::N],
-            float res[CONFIG_T::tpose_out_conf::N], void* stream = nullptr) {
-    
-    size_t ws_size = sizeof(data_T) * CONFIG_T::tpose_inp0_config::N + 
-                     sizeof(data_T) * CONFIG_T::tpose_inp1_config::N + 
+__global__ AICORE void einsum_fused_kernel(
+        __gm__ const data_T* data0, __gm__ const data_T* data1,
+        __gm__ data_T* ws0, __gm__ data_T* ws1, __gm__ float* ws_res,
+        __gm__ float* res, uint64_t ffts_addr) {
+    set_ffts_base_addr(ffts_addr);
+
+    if constexpr (DAV_VEC) {
+#ifndef __PTO_AUTO__
+        set_mask_norm();
+        set_vector_mask((uint64_t)-1, (uint64_t)-1);
+#endif
+        // input0's transpose output is [.., contract]; pad its innermost contract
+        // dim C up to the fractal width K so the Cube reads a full K-wide A. input1
+        // (contract is an outer dim) and the output need no padding — input1 just
+        // lands in a K-row-padded, pre-zeroed ws1 buffer.
+        constexpr unsigned C = CONFIG_T::n_contract;
+        constexpr unsigned K = (C + 15) / 16 * 16;
+        unsigned lane = get_block_idx() * 2 + get_subblockid();
+        unsigned nlanes = get_block_num() * 2;
+        transpose_inline<data_T, typename CONFIG_T::tpose_inp0_config, C, K>(data0, ws0, lane, nlanes);
+        transpose_inline<data_T, typename CONFIG_T::tpose_inp1_config>(data1, ws1, lane, nlanes);
+    }
+
+    SyncAll<false>();  // inputs transposed -> matmul
+
+    if constexpr (DAV_CUBE) {
+        batched_matmul_inline<data_T, CONFIG_T>(ws0, ws1, ws_res, get_block_idx(), get_block_num());
+    }
+
+    SyncAll<false>();  // matmul done -> output transpose
+
+    if constexpr (DAV_VEC) {
+        unsigned lane = get_block_idx() * 2 + get_subblockid();
+        unsigned nlanes = get_block_num() * 2;
+        transpose_inline<float, typename CONFIG_T::tpose_out_conf>(ws_res, res, lane, nlanes);
+    }
+}
+
+// Host launcher for the fused kernel (single launch). Covers K==C (any batch) and
+// K!=C with no batch (I==1); the workspace is K-padded so the Cube reads a full
+// K-wide A / K-row B, and only the pad regions need zeroing.
+template <typename data_T, typename CONFIG_T>
+void einsum_fused(const data_T* data0, const data_T* data1, float* res, void* stream) {
+    int32_t device_id = 0;
+    aclrtGetDevice(&device_id);
+    int64_t core_num = 1;
+    aclrtGetDeviceInfo(device_id, ACL_DEV_ATTR_AICORE_CORE_NUM, &core_num);
+
+    constexpr unsigned L0 = CONFIG_T::n_free0;
+    constexpr unsigned L1 = CONFIG_T::n_free1;
+    constexpr unsigned C  = CONFIG_T::n_contract;
+    constexpr unsigned I  = CONFIG_T::n_inplace;
+    constexpr unsigned K  = (C + 15) / 16 * 16;  // fractal-aligned contraction width
+
+    // K-padded operand buffers (== the C-packed transpose output when K==C).
+    const size_t ws0_elems = size_t(I) * L0 * K;
+    const size_t ws1_elems = size_t(I) * K * L1;
+    const size_t ws0_bytes = sizeof(data_T) * ws0_elems;
+    const size_t ws1_bytes = sizeof(data_T) * ws1_elems;
+    const size_t wsr_bytes = sizeof(float) * CONFIG_T::tpose_out_conf::N;
+
+    void* workspace = nullptr;
+    aclrtMalloc(&workspace, ws0_bytes + ws1_bytes + wsr_bytes, ACL_MEM_MALLOC_NORMAL_ONLY);
+
+    data_T* ws0 = reinterpret_cast<data_T*>(workspace);
+    data_T* ws1 = reinterpret_cast<data_T*>(ws0 + ws0_elems);
+    float* ws_res = reinterpret_cast<float*>(ws1 + ws1_elems);
+
+    // Zero the contraction-pad regions (rows/cols K..C are not written by the
+    // transposes and must contribute 0 to the matmul). Only needed when K != C.
+    if constexpr (K != C) {
+        aclrtMemsetAsync(ws0, ws0_bytes, 0, ws0_bytes, stream);
+        aclrtMemsetAsync(ws1, ws1_bytes, 0, ws1_bytes, stream);
+    }
+
+    uint32_t ffts_len = 0;
+    uint64_t ffts_addr = 0;
+    rtGetC2cCtrlAddr(&ffts_addr, &ffts_len);
+
+    einsum_fused_kernel<data_T, CONFIG_T><<<core_num, nullptr, stream>>>(
+        data0, data1, ws0, ws1, ws_res, res, ffts_addr);
+
+    aclrtSynchronizeStream(stream);
+    aclrtFree(workspace);
+}
+
+// Multi-launch einsum (4 kernels). Retained for the batched non-aligned case
+// (K!=C and I>1), where ws1 would need per-batch K-row padding that the fused
+// kernel's transpose destinations don't yet express; batched_matmul host-pads it.
+template <typename data_T, typename CONFIG_T>
+void einsum_multilaunch(const data_T* data0, const data_T* data1, float* res, void* stream) {
+    size_t ws_size = sizeof(data_T) * CONFIG_T::tpose_inp0_config::N +
+                     sizeof(data_T) * CONFIG_T::tpose_inp1_config::N +
                      sizeof(float) * CONFIG_T::tpose_out_conf::N;
-    
+
     void* workspace = nullptr;
     aclrtMalloc(&workspace, ws_size, ACL_MEM_MALLOC_NORMAL_ONLY);
 
@@ -557,16 +738,29 @@ void einsum(const data_T data0[CONFIG_T::tpose_inp0_config::N], const data_T dat
     data_T* ws1 = reinterpret_cast<data_T*>(ws0 + CONFIG_T::tpose_inp0_config::N);
     float* ws_res = reinterpret_cast<float*>(ws1 + CONFIG_T::tpose_inp1_config::N);
 
-    // Launch kernels sequentially on the same stream
     transpose<data_T, typename CONFIG_T::tpose_inp0_config>(data0, ws0, stream);
     transpose<data_T, typename CONFIG_T::tpose_inp1_config>(data1, ws1, stream);
-    
     batched_matmul<data_T, CONFIG_T>(ws0, ws1, ws_res, stream);
-    
     transpose<float, typename CONFIG_T::tpose_out_conf>(ws_res, res, stream);
 
     aclrtSynchronizeStream(stream);
     aclrtFree(workspace);
+}
+
+template <typename data_T, typename CONFIG_T>
+void einsum(const data_T data0[CONFIG_T::tpose_inp0_config::N], const data_T data1[CONFIG_T::tpose_inp1_config::N],
+            float res[CONFIG_T::tpose_out_conf::N], void* stream = nullptr) {
+    constexpr unsigned C = CONFIG_T::n_contract;
+    constexpr unsigned K = (C + 15) / 16 * 16;
+    constexpr unsigned I = CONFIG_T::n_inplace;
+    // Fused single-kernel path covers K==C (any batch) and K!=C without batching
+    // (I==1). Batched non-aligned contraction (K!=C and I>1) still needs ws1's
+    // per-batch K-row padding, which the multi-launch path does host-side.
+    if constexpr (K == C || I == 1) {
+        einsum_fused<data_T, CONFIG_T>(data0, data1, res, stream);
+    } else {
+        einsum_multilaunch<data_T, CONFIG_T>(data0, data1, res, stream);
+    }
 }
 
 } // namespace pto_einsum

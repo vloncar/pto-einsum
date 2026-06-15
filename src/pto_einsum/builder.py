@@ -345,7 +345,7 @@ extern "C" {{
                     "-I", f"{ascend_path}/include",
                     "-I", f"{pto_lib_path}/include",
                     "-L", f"{ascend_path}/lib64",
-                    "-lascendcl",
+                    "-lascendcl", "-lruntime",
                     self.cpp_filename, "-o", self.so_filename
                 ]
             

@@ -21,6 +21,11 @@ from pto_einsum import einsum, EinsumBuilder
     # custom index layouts
     ("ai, ja -> ij", (32, 16), (64, 32)),
     ("abc, cd -> abd", (32, 16, 32), (32, 64)),
+    # non-16-aligned contraction (K != C): exercises the fused kernel's K-padded
+    # transpose destinations. j=20 -> K=32: identity-copy inputs (ij,jk) and
+    # a=20 -> K=32: 2D-TTRANS inputs (ai,ja).
+    ("ij, jk -> ik", (32, 20), (20, 128)),
+    ("ai, ja -> ij", (20, 16), (64, 20)),
 ])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_einsum_correctness(equation, shape0, shape1, dtype):

@@ -59,10 +59,42 @@ The Python layer is a dynamic JIT compiler and launcher.
 
 ## 2. PTO / C++ side (`pto_einsum.h`)
 
-The three pipeline stages are launched by the host (`einsum()` in the header) as
-separate kernels on a single stream, so they execute in order without an explicit
-cross-core barrier. (A `SyncAll()` full-barrier helper is provided for future
-fused kernels but is not used by the current pipeline.)
+`einsum()` runs the whole transpose → matmul → transpose pipeline in a **single
+fused mix-kernel launch** (`einsum_fused_kernel`) where the AIC (Cube) and AIV
+(Vector) cores cooperate, replacing the previous four separate kernel launches.
+The phases are separated by full cross-core barriers (`SyncAll<false>()`):
+
+```
+[Vec ]  Phase A: transpose data0->ws0, data1->ws1
+-- SyncAll<false>() --   (Vec -> Cube)
+[Cube]  Phase B: ws0 @ ws1 -> ws_res
+-- SyncAll<false>() --   (Cube -> Vec)
+[Vec ]  Phase C: transpose ws_res->res
+```
+
+The host fetches the FFTS control address (`rtGetC2cCtrlAddr`, forward-declared to
+avoid a profiling-header dependency; link `-lruntime`) and the kernel calls
+`set_ffts_base_addr` before the barriers. Vector work is distributed over
+`block_num*2` sub-block lanes (`block_idx*2 + subblockid`); Cube work over
+`block_num`. The matmul body (`batched_matmul_inline`) and the transpose dispatch
+(`transpose_inline`) are factored out so the standalone kernels and the fused
+kernel share one implementation.
+
+**Contraction padding without a host round-trip.** The Cube needs a `K`-wide
+operand A and `K`-row operand B (`K = ⌈C/16⌉·16`; the Left-operand partial-C0
+ND→NZ bug). The fused kernel allocates `ws0`/`ws1` K-padded, zeroes them once with
+`aclrtMemsetAsync` (only when `K != C`), and the **input0 transpose writes the
+padded layout directly**: its output's innermost (contract) dim is padded from `C`
+to `K` via a `DST_PAD` template arg (2D `TTRANS` path) or `padded_copy_inline`
+(identity path). `ws1` (contract is an outer dim) just lands in the larger
+pre-zeroed buffer. This removes the old mid-pipeline `malloc`/`memcpy`/stream-sync
+(a ~21× speedup on the degenerate outer-product case).
+
+**Scope.** The fused path covers `K==C` (any batch) and `K!=C` without batching
+(`I==1`). Batched non-aligned contraction (`K!=C` and `I>1`) would need per-batch
+`K`-row padding of `ws1` that the transpose destinations don't yet express, so it
+falls back to the retained multi-launch path (`einsum_multilaunch`), which
+host-pads via `batched_matmul`.
 
 ### Phase 1 & 3 — Vector-core transpose
 
@@ -105,17 +137,21 @@ itself:
   - *Whole-tensor* (the three padded tiles fit the ~184 KB UB budget): a single
     `TLOAD → TTRANS → TSTORE`. Both GM transfers are one (possibly strided) 2D
     move, so arbitrary (even unaligned) dims work — small odd-shaped tensors land
-    here.
+    here. A single tile is one unit of work, so only one Vec core runs it (these
+    tensors are small by definition).
   - *Blocked* (too large for UB): `TTRANS` one `BR×BC` (64×64) block at a time,
-    each block a single strided `TLOAD → TTRANS → TSTORE`. The per-block GM rows
-    start at `r·srcCols` / `c·srcRows`, so this path still requires 16-aligned
-    dims to keep every transfer 32-byte aligned (a **GM-DMA** constraint, not a
-    `TTRANS` one; a `static_assert` enforces it, unaligned-large is Stage 2).
+    each block a single strided `TLOAD → TTRANS → TSTORE`. The blocks are
+    independent, so the `⌈srcRows/BR⌉ × ⌈srcCols/BC⌉` block grid is flattened to a
+    1D index space and **block-distributed across all Vec cores** (mirroring how
+    the Cube matmul distributes its output-tile grid) — large transposes use the
+    whole vector engine, not a single core. The per-block GM rows start at
+    `r·srcCols` / `c·srcRows`, so this path still requires 16-aligned dims to keep
+    every transfer 32-byte aligned (a **GM-DMA** constraint, not a `TTRANS` one; a
+    `static_assert` enforces it; unaligned-large is not yet supported).
 
 So the cases are: (1) any tensor that fits UB → fully general hardware transpose;
 (2) large 16-aligned tensors → blocked hardware transpose; (3) large *unaligned*
-tensors → not yet supported (Stage 2, blocked by the GM-DMA alignment, not by
-`TTRANS`).
+tensors → not yet supported (blocked by the GM-DMA alignment, not by `TTRANS`).
 
 ### Phase 2 — Cube-core tiled matmul
 
@@ -129,16 +165,17 @@ block (fp32 = 8, fp16 = 16) so the `Mat` InnerCols = C0 constraint is satisfied
 too. The logical dims are therefore padded up: `M = ⌈L0/16⌉·16`, `K = ⌈C/16⌉·16`,
 `N = ⌈L1/16⌉·16`.
 
-**Contraction padding (host).** `batched_matmul` guarantees the GM `A`/`B`
-buffers are `K`-wide and zero-padded along the contraction. This sidesteps a
-Left-operand ND→NZ quirk where a *partial-C0* valid column count misplaces rows
-across fractal blocks; loading a full `K`-wide `A` avoids that path, and the zero
-padding contributes nothing to the sum.
+**Contraction padding.** The caller guarantees the GM `A`/`B` buffers are `K`-wide
+and zero-padded along the contraction (the fused kernel's input transposes write
+the padded layout directly; the multi-launch fallback pads host-side). This
+sidesteps a Left-operand ND→NZ quirk where a *partial-C0* valid column count
+misplaces rows across fractal blocks; loading a full `K`-wide `A` avoids that path,
+and the zero padding contributes nothing to the sum.
 
-**Stage 1 tiling.** The per-batch output is partitioned into an `Mt × Nt` tile
-grid (tile sizes are `min(config, padded-dim)`, multiples of 16). Stage 1
-requires `M%Mt == N%Nt == K%Kt == 0` (full grid, no partial tiles — that is
-Stage 2), enforced by a `static_assert`. All `(batch, m-tile, n-tile)` units are
+**Tiling.** The per-batch output is partitioned into an `Mt × Nt` tile grid (tile
+sizes are `min(config, padded-dim)`, multiples of 16). It requires
+`M%Mt == N%Nt == K%Kt == 0` (full grid, no partial tiles), enforced by a
+`static_assert`. All `(batch, m-tile, n-tile)` units are
 flattened into a 1D index space and block-distributed across the AI cores. For
 each output tile:
 
@@ -171,10 +208,10 @@ stale `.so` is reused and the change appears to have no effect.
 
 ## Roadmap
 
-- **Stage 1.5 — double buffering.** The K-accumulation loop currently uses a
-  coarse `pipe_barrier(PIPE_ALL)` between steps. Replacing it with ping-pong
-  (double-buffered) L1↔L0 tiles will overlap the next load with the current
-  matmul. The tile allocations are structured with this in mind.
-- **Stage 2 — tails.** Support partial tiles (problem dims not divisible by the
-  tile size) and unaligned large 2D transposes, removing the Stage 1
-  divisibility/alignment constraints.
+- Support partial tiles (problem dims not divisible by the tile size), removing
+  the matmul divisibility constraint.
+- Support unaligned large 2D transposes, removing the blocked-transpose 16-aligned
+  constraint.
+- Fuse the batched non-aligned contraction case (`K != C` and `I > 1`), currently
+  served by the multi-launch fallback, by expressing per-batch `K`-row padding in
+  the transpose destinations.
