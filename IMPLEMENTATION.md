@@ -51,11 +51,20 @@ The Python layer is a dynamic JIT compiler and launcher.
   of the generated source under the build dir and reused if present.
   `PTO_LIB_PATH` (pto-isa headers) is **required** for the NPU path.
 
-- **Dispatch** (`build`/`run`): a device workspace buffer is allocated for the
-  intermediate transposed/contracted matrices, inputs are made contiguous, and
-  the compiled `run_einsum` is called via `ctypes` on the current NPU stream. The
-  returned callable validates shape/dtype on each call so a built kernel can be
-  reused.
+- **Dispatch** (`build`/`run`): the returned callable validates shape/dtype, makes
+  inputs contiguous, and launches on the current NPU stream via `ctypes`. The
+  device workspace (intermediate transposed/contracted matrices) is allocated
+  **once** on the first call and reused — `run_einsum_setup` allocates it and zeros
+  the contraction-pad regions once (they stay zero because the transposes only
+  overwrite the data columns and the matmul never writes `ws0`/`ws1`);
+  `run_einsum_exec` then only launches the kernel (no `malloc`/`memset`/`free` and
+  no `aclrtSynchronizeStream` — same-stream ordering serialises reuse and the
+  output's downstream torch consumers, as `torch.einsum` is itself async);
+  `run_einsum_teardown` frees the workspace at `cleanup()` (or on builder GC). This
+  hoists the per-call allocator churn and host-device sync out of the hot path — a
+  large win on the small/copy-bound cases, where they dominated (e.g. the K≠C
+  batched-unaligned case dropped ~6×). The one-shot `run_einsum` (setup + exec +
+  sync + teardown) is kept for the CPU path and non-reusing callers.
 
 ## 2. PTO / C++ side (`pto_einsum.h`)
 

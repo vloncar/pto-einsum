@@ -83,6 +83,23 @@ def test_builder_reuse():
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
 
+def test_builder_reuse_kneqc():
+    # The reused runner allocates its K-padded workspace once and zeros the
+    # contraction-pad regions once. This exercises a K != C equation across many
+    # calls with fresh data to ensure the pad stays zero (no stale carry-over) and
+    # the persistent workspace yields correct results every time. (j=20 -> K=32.)
+    equation = "bij, bjk -> bik"
+    shape0, shape1 = (8, 16, 20), (8, 20, 64)
+    runner = EinsumBuilder(equation, [shape0, shape1], torch.float32, device=TEST_DEVICE).build()
+
+    for _ in range(10):
+        inp0 = torch.rand(shape0, dtype=torch.float32, device=TEST_DEVICE)
+        inp1 = torch.rand(shape1, dtype=torch.float32, device=TEST_DEVICE)
+        result = runner(inp0, inp1)
+        expected = torch.einsum(equation, inp0, inp1)
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+
 def test_validation_errors():
     equation = "ij, jk -> ik"
     shape0 = (32, 64)

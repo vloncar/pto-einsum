@@ -49,5 +49,14 @@ extern "C" {{
     void run_einsum(const {data_t}* input0, const {data_t}* input1, float* output, void* stream) {{
         pto_einsum::einsum<{data_t}, config_einsum>(input0, input1, output, stream);
     }}
+    void* run_einsum_setup(void* stream) {{
+        return pto_einsum::einsum_setup<{data_t}, config_einsum>(stream);
+    }}
+    void run_einsum_exec(const {data_t}* input0, const {data_t}* input1, float* output, void* workspace, void* stream) {{
+        pto_einsum::einsum_exec<{data_t}, config_einsum>(input0, input1, output, workspace, stream);
+    }}
+    void run_einsum_teardown(void* workspace) {{
+        pto_einsum::einsum_teardown(workspace);
+    }}
 }}
 """

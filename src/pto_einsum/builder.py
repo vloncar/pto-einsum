@@ -50,6 +50,7 @@ class EinsumBuilder:
         self.c_type = None
         self.code_hash = None
         self.target_dir = None
+        self._workspace = None  # persistent NPU workspace (lazily allocated in run)
 
     def _validate_einsum_expr(self, fn: str, shape0: tuple[int, ...], shape1: tuple[int, ...]):
         inp, out = map(str.strip, fn.split('->'))
@@ -353,10 +354,25 @@ extern "C" {{
             if result.returncode != 0:
                 raise RuntimeError(f"Compilation failed:\n{result.stderr}")
 
+    def __del__(self):
+        # Safety net for callers that drop the builder without cleanup() (e.g. the
+        # one-shot einsum()): free the device workspace so it does not leak.
+        try:
+            if getattr(self, "_workspace", None) is not None and getattr(self, "lib", None) is not None:
+                self.lib.run_einsum_teardown(self._workspace)
+                self._workspace = None
+        except Exception:
+            pass
+
     def cleanup(self):
+        # Free the persistent workspace (while the library is still loaded).
+        if self._workspace is not None and self.lib is not None:
+            self.lib.run_einsum_teardown(self._workspace)
+            self._workspace = None
+
         # Unload/clear CDLL reference to release system locks
         self.lib = None
-        
+
         # Delete generated build directory and contents
         if self.target_dir and os.path.exists(self.target_dir):
             shutil.rmtree(self.target_dir)
@@ -400,6 +416,21 @@ extern "C" {{
         ]
         self.lib.run_einsum.restype = None
 
+        # Persistent-workspace path (NPU only): setup once, exec per call, free at cleanup.
+        if self.device != "cpu":
+            self.lib.run_einsum_setup.argtypes = [ctypes.c_void_p]  # stream
+            self.lib.run_einsum_setup.restype = ctypes.c_void_p     # workspace
+            self.lib.run_einsum_exec.argtypes = [
+                ctypes.POINTER(self.c_type),     # input0
+                ctypes.POINTER(self.c_type),     # input1
+                ctypes.POINTER(ctypes.c_float),  # output
+                ctypes.c_void_p,                 # workspace
+                ctypes.c_void_p                  # stream
+            ]
+            self.lib.run_einsum_exec.restype = None
+            self.lib.run_einsum_teardown.argtypes = [ctypes.c_void_p]  # workspace
+            self.lib.run_einsum_teardown.restype = None
+
     def build(self):
         self.parse_equation()
         self.generate_code()
@@ -432,14 +463,22 @@ extern "C" {{
                 output_tensor_npu = torch.zeros(self.recipe['out_interpret_shape'], dtype=torch.float32, device="cpu")
                 stream_ptr = None
             else:
-                output_tensor_npu = torch.zeros(self.recipe['out_interpret_shape'], dtype=torch.float32, device="npu")
+                # The kernel writes every output element, so skip zero-init.
+                output_tensor_npu = torch.empty(self.recipe['out_interpret_shape'], dtype=torch.float32, device="npu")
                 stream_ptr = torch.npu.current_stream()._as_parameter_
-            
+
             in0_ptr = ctypes.cast(inp0.data_ptr(), ctypes.POINTER(self.c_type))
             in1_ptr = ctypes.cast(inp1.data_ptr(), ctypes.POINTER(self.c_type))
             out_ptr = ctypes.cast(output_tensor_npu.data_ptr(), ctypes.POINTER(ctypes.c_float))
-            
-            self.lib.run_einsum(in0_ptr, in1_ptr, out_ptr, stream_ptr)
+
+            if self.device == "cpu":
+                self.lib.run_einsum(in0_ptr, in1_ptr, out_ptr, stream_ptr)
+            else:
+                # Allocate (and zero the contraction pad) once, then reuse across
+                # calls; exec just launches on the stream (no per-call alloc/sync).
+                if self._workspace is None:
+                    self._workspace = self.lib.run_einsum_setup(stream_ptr)
+                self.lib.run_einsum_exec(in0_ptr, in1_ptr, out_ptr, self._workspace, stream_ptr)
             return output_tensor_npu
 
         return run

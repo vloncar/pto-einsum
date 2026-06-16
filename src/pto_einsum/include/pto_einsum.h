@@ -777,23 +777,31 @@ void einsum_multilaunch(const data_T* data0, const data_T* data1, float* res, vo
 // (any batch) and K!=C (any batch, with the input transposes writing the K-padded
 // layout). The workspace is K-padded so the Cube reads a full K-wide A / K-row B,
 // and only the pad regions need zeroing.
+// The fused dispatch is split so a reused runner pays the per-call cost only for
+// the launch. einsum_setup allocates the K-padded workspace once and zeros its
+// contraction-pad regions once; einsum_exec just launches; einsum_teardown frees.
+// This hoists aclrtMalloc/Memset/Free and the host-device sync out of the hot path
+// (they dominate these sub-0.1 ms kernels). einsum() keeps the one-shot all-in-one.
+
+// Workspace element counts: [ws0 (I*L0*K) | ws1 (I*K*L1) | ws_res (out, float)].
 template <typename data_T, typename CONFIG_T>
-void einsum(const data_T data0[CONFIG_T::tpose_inp0_config::N], const data_T data1[CONFIG_T::tpose_inp1_config::N],
-            float res[CONFIG_T::tpose_out_conf::N], void* stream = nullptr) {
-    int32_t device_id = 0;
-    aclrtGetDevice(&device_id);
-    int64_t core_num = 1;
-    aclrtGetDeviceInfo(device_id, ACL_DEV_ATTR_AICORE_CORE_NUM, &core_num);
+inline size_t einsum_ws0_elems() {
+    return size_t(CONFIG_T::n_inplace) * CONFIG_T::n_free0 * ((CONFIG_T::n_contract + 15) / 16 * 16);
+}
+template <typename data_T, typename CONFIG_T>
+inline size_t einsum_ws1_elems() {
+    return size_t(CONFIG_T::n_inplace) * ((CONFIG_T::n_contract + 15) / 16 * 16) * CONFIG_T::n_free1;
+}
 
-    constexpr unsigned L0 = CONFIG_T::n_free0;
-    constexpr unsigned L1 = CONFIG_T::n_free1;
-    constexpr unsigned C  = CONFIG_T::n_contract;
-    constexpr unsigned I  = CONFIG_T::n_inplace;
-    constexpr unsigned K  = (C + 15) / 16 * 16;  // fractal-aligned contraction width
-
-    // K-padded operand buffers (== the C-packed transpose output when K==C).
-    const size_t ws0_elems = size_t(I) * L0 * K;
-    const size_t ws1_elems = size_t(I) * K * L1;
+// Allocate the workspace once and zero the pad regions once. The per-call
+// transposes only overwrite the data columns/rows (cols/rows K..C stay 0) and the
+// matmul never writes ws0/ws1, so the zeroing holds across calls. Returns the base.
+template <typename data_T, typename CONFIG_T>
+void* einsum_setup(void* stream = nullptr) {
+    constexpr unsigned C = CONFIG_T::n_contract;
+    constexpr unsigned K = (C + 15) / 16 * 16;
+    const size_t ws0_elems = einsum_ws0_elems<data_T, CONFIG_T>();
+    const size_t ws1_elems = einsum_ws1_elems<data_T, CONFIG_T>();
     const size_t ws0_bytes = sizeof(data_T) * ws0_elems;
     const size_t ws1_bytes = sizeof(data_T) * ws1_elems;
     const size_t wsr_bytes = sizeof(float) * CONFIG_T::tpose_out_conf::N;
@@ -801,16 +809,33 @@ void einsum(const data_T data0[CONFIG_T::tpose_inp0_config::N], const data_T dat
     void* workspace = nullptr;
     aclrtMalloc(&workspace, ws0_bytes + ws1_bytes + wsr_bytes, ACL_MEM_MALLOC_NORMAL_ONLY);
 
+    if constexpr (K != C) {
+        data_T* ws0 = reinterpret_cast<data_T*>(workspace);
+        data_T* ws1 = reinterpret_cast<data_T*>(ws0 + ws0_elems);
+        aclrtMemsetAsync(ws0, ws0_bytes, 0, ws0_bytes, stream);
+        aclrtMemsetAsync(ws1, ws1_bytes, 0, ws1_bytes, stream);
+        aclrtSynchronizeStream(stream);  // pad must be zero before the first exec
+    }
+    return workspace;
+}
+
+// Launch the fused kernel against a pre-allocated workspace. No alloc/memset/sync/
+// free: a reused runner enqueues on one stream, which orders the calls (and the
+// output's downstream torch consumers), exactly as torch.einsum is itself async.
+template <typename data_T, typename CONFIG_T>
+void einsum_exec(const data_T* data0, const data_T* data1, float* res,
+                 void* workspace, void* stream = nullptr) {
+    int32_t device_id = 0;
+    aclrtGetDevice(&device_id);
+    int64_t core_num = 1;
+    aclrtGetDeviceInfo(device_id, ACL_DEV_ATTR_AICORE_CORE_NUM, &core_num);
+
+    const size_t ws0_elems = einsum_ws0_elems<data_T, CONFIG_T>();
+    const size_t ws1_elems = einsum_ws1_elems<data_T, CONFIG_T>();
+
     data_T* ws0 = reinterpret_cast<data_T*>(workspace);
     data_T* ws1 = reinterpret_cast<data_T*>(ws0 + ws0_elems);
     float* ws_res = reinterpret_cast<float*>(ws1 + ws1_elems);
-
-    // Zero the contraction-pad regions (rows/cols K..C are not written by the
-    // transposes and must contribute 0 to the matmul). Only needed when K != C.
-    if constexpr (K != C) {
-        aclrtMemsetAsync(ws0, ws0_bytes, 0, ws0_bytes, stream);
-        aclrtMemsetAsync(ws1, ws1_bytes, 0, ws1_bytes, stream);
-    }
 
     uint32_t ffts_len = 0;
     uint64_t ffts_addr = 0;
@@ -818,9 +843,21 @@ void einsum(const data_T data0[CONFIG_T::tpose_inp0_config::N], const data_T dat
 
     einsum_fused_kernel<data_T, CONFIG_T><<<core_num, nullptr, stream>>>(
         data0, data1, ws0, ws1, ws_res, res, ffts_addr);
+}
 
+inline void einsum_teardown(void* workspace) {
+    if (workspace) aclrtFree(workspace);
+}
+
+// One-shot all-in-one (setup + exec + sync + teardown). Used by the CPU-symmetric
+// run_einsum entry and any caller that does not reuse a workspace.
+template <typename data_T, typename CONFIG_T>
+void einsum(const data_T data0[CONFIG_T::tpose_inp0_config::N], const data_T data1[CONFIG_T::tpose_inp1_config::N],
+            float res[CONFIG_T::tpose_out_conf::N], void* stream = nullptr) {
+    void* workspace = einsum_setup<data_T, CONFIG_T>(stream);
+    einsum_exec<data_T, CONFIG_T>(data0, data1, res, workspace, stream);
     aclrtSynchronizeStream(stream);
-    aclrtFree(workspace);
+    einsum_teardown(workspace);
 }
 
 } // namespace pto_einsum
