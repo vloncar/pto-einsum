@@ -88,38 +88,44 @@ struct IsIdentityPerm {
     static constexpr bool value = IsIdentityPermImpl<CONFIG_T, 0, (0 < CONFIG_T::dims)>::value;
 };
 
+// Copy one chunk (a single row, <= TILE_COLS wide with valid extent `w`) from GM
+// `src` to GM `dst` through a reused UB tile, with the RAW (load->store) and WAR
+// (store->next-load) pipe sync. This is the shared inner body of the three GM->GM
+// copy paths below (identity copy, padded copy, batched padded copy); only their
+// address arithmetic and chunking differ, so they each set up the UB tile once and
+// drive this per chunk.
+template <typename data_T, unsigned TILE_COLS, typename TileT>
+AICORE inline void copy_chunk_through_ub(TileT& ubTile, __gm__ const data_T* src, __gm__ data_T* dst, unsigned w) {
+    using GlobalData = GlobalTensor<data_T, pto::Shape<1, 1, 1, 1, TILE_COLS>, pto::Stride<1, 1, 1, TILE_COLS, 1>>;
+    ubTile.SetValidRow(1);
+    ubTile.SetValidCol(w);
+    GlobalData sg(const_cast<__gm__ data_T*>(src));
+    GlobalData dg(dst);
+
+    TLOAD(ubTile, sg);
+
+    set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);   // RAW: store waits its load
+    wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+
+    TSTORE(dg, ubTile);
+
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);   // WAR: next load reuses ubTile
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+}
+
 // Identity copy: TLOAD src → TSTORE dst as flat 1D chunks through UB (src and
 // dst share the same layout). Caller distributes the [start, end) range.
 template <typename data_T, typename CONFIG_T>
 AICORE inline void transpose_copy_inline(__gm__ const data_T* src, __gm__ data_T* dst, unsigned start, unsigned end) {
     constexpr unsigned TILE_COLS = 128;  // elems/row; 32-byte aligned for fp16
-    constexpr unsigned TILE_ROWS = 1;
+    using TileData = Tile<TileType::Vec, data_T, 1, TILE_COLS, BLayout::RowMajor, -1, -1>;
 
-    using TileShape = pto::Shape<1, 1, 1, TILE_ROWS, TILE_COLS>;
-    using TileStride = pto::Stride<1, 1, 1, TILE_COLS, 1>;
-    using GlobalData = GlobalTensor<data_T, TileShape, TileStride>;
-    using TileData = Tile<TileType::Vec, data_T, TILE_ROWS, TILE_COLS, BLayout::RowMajor, -1, -1>;
-
-    TileData ubTile(TILE_ROWS, TILE_COLS);
+    TileData ubTile(1, TILE_COLS);
     TASSIGN(ubTile, 0x0);
 
     for (unsigned i = start; i < end; i += TILE_COLS) {
         unsigned chunk = ((i + TILE_COLS) <= end) ? TILE_COLS : (end - i);
-        ubTile.SetValidCol(chunk);
-        ubTile.SetValidRow(1);
-
-        GlobalData srcGlobal(const_cast<__gm__ data_T*>(src + i));
-        GlobalData dstGlobal(dst + i);
-
-        TLOAD(ubTile, srcGlobal);
-
-        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);   // RAW: store waits its load
-        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-
-        TSTORE(dstGlobal, ubTile);
-
-        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);   // WAR: next load reuses ubTile
-        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+        copy_chunk_through_ub<data_T, TILE_COLS>(ubTile, src + i, dst + i, chunk);
     }
 }
 
@@ -133,9 +139,6 @@ AICORE inline void padded_copy_inline(__gm__ const data_T* src, __gm__ data_T* d
                                       unsigned nrows, unsigned rowW, unsigned dstStride,
                                       unsigned lane, unsigned nlanes) {
     constexpr unsigned TILE_COLS = 128;
-    using TileShape = pto::Shape<1, 1, 1, 1, TILE_COLS>;
-    using TileStride = pto::Stride<1, 1, 1, TILE_COLS, 1>;
-    using GlobalData = GlobalTensor<data_T, TileShape, TileStride>;
     using TileData = Tile<TileType::Vec, data_T, 1, TILE_COLS, BLayout::RowMajor, -1, -1>;
 
     TileData ubTile(1, TILE_COLS);
@@ -148,19 +151,7 @@ AICORE inline void padded_copy_inline(__gm__ const data_T* src, __gm__ data_T* d
     for (unsigned r = r0; r < r1; r++) {
         for (unsigned c = 0; c < rowW; c += TILE_COLS) {
             unsigned w = (c + TILE_COLS) <= rowW ? TILE_COLS : (rowW - c);
-            ubTile.SetValidRow(1);
-            ubTile.SetValidCol(w);
-            GlobalData sg(const_cast<__gm__ data_T*>(src + r * rowW + c));
-            GlobalData dg(dst + r * dstStride + c);
-            TLOAD(ubTile, sg);
-
-            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);   // RAW: store waits its load
-            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-
-            TSTORE(dg, ubTile);
-
-            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);   // WAR: next load reuses ubTile
-            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+            copy_chunk_through_ub<data_T, TILE_COLS>(ubTile, src + r * rowW + c, dst + r * dstStride + c, w);
         }
     }
 }
@@ -177,9 +168,6 @@ AICORE inline void batched_pad_copy_inline(__gm__ const data_T* src, __gm__ data
                                            unsigned nbatch, unsigned rows, unsigned rowW,
                                            unsigned dstBatchStride, unsigned lane, unsigned nlanes) {
     constexpr unsigned TILE_COLS = 128;
-    using TileShape = pto::Shape<1, 1, 1, 1, TILE_COLS>;
-    using TileStride = pto::Stride<1, 1, 1, TILE_COLS, 1>;
-    using GlobalData = GlobalTensor<data_T, TileShape, TileStride>;
     using TileData = Tile<TileType::Vec, data_T, 1, TILE_COLS, BLayout::RowMajor, -1, -1>;
 
     TileData ubTile(1, TILE_COLS);
@@ -195,19 +183,8 @@ AICORE inline void batched_pad_copy_inline(__gm__ const data_T* src, __gm__ data
         unsigned c = g - i * rows;   // row within the batch's C valid rows
         for (unsigned col = 0; col < rowW; col += TILE_COLS) {
             unsigned w = (col + TILE_COLS) <= rowW ? TILE_COLS : (rowW - col);
-            ubTile.SetValidRow(1);
-            ubTile.SetValidCol(w);
-            GlobalData sg(const_cast<__gm__ data_T*>(src + g * rowW + col));
-            GlobalData dg(dst + i * dstBatchStride + c * rowW + col);
-            TLOAD(ubTile, sg);
-
-            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);   // RAW: store waits its load
-            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-
-            TSTORE(dg, ubTile);
-
-            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);   // WAR: next load reuses ubTile
-            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+            copy_chunk_through_ub<data_T, TILE_COLS>(
+                ubTile, src + g * rowW + col, dst + i * dstBatchStride + c * rowW + col, w);
         }
     }
 }
