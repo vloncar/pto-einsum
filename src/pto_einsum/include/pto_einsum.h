@@ -398,9 +398,164 @@ AICORE inline void transpose_2d_inline(__gm__ const data_T* src, __gm__ data_T* 
 // a partial valid extent on boundary tiles (GM is L0xK / KxL1, not padded),
 // handled via SetValidRow/SetValidCol.
 //
+// One output tile: contract the K-tile range [kStart, kStart+kCount) of tile `t`
+// and store the result. ATOMIC selects an atomic-add store — used by split-K, where
+// several cores each contract a disjoint K-slice of the same tile into a pre-zeroed
+// output — versus a plain overwriting store for the one-core-per-tile case.
+template <typename data_T, typename CONFIG_T, bool ATOMIC>
+AICORE inline void matmul_one_tile_inline(__gm__ const data_T* ws0, __gm__ const data_T* ws1,
+                                          __gm__ float* ws_res, unsigned t,
+                                          unsigned kStart, unsigned kCount) {
+        constexpr unsigned L0 = CONFIG_T::n_free0;
+        constexpr unsigned L1 = CONFIG_T::n_free1;
+        constexpr unsigned C = CONFIG_T::n_contract;
+        constexpr unsigned M = (L0 + 15) / 16 * 16;
+        constexpr unsigned K = (C + 15) / 16 * 16;
+        constexpr unsigned N = (L1 + 15) / 16 * 16;
+        constexpr unsigned Mt = CONFIG_T::tile_m < M ? CONFIG_T::tile_m : M;
+        constexpr unsigned Nt = CONFIG_T::tile_n < N ? CONFIG_T::tile_n : N;
+        constexpr unsigned Kt = CONFIG_T::tile_k < K ? CONFIG_T::tile_k : K;
+        constexpr unsigned nN = N / Nt;
+        constexpr unsigned tiles_per_batch = (M / Mt) * nN;
+
+        using ShapeA = pto::Shape<1, 1, 1, -1, Kt>;
+        using StrideA = pto::Stride<1, 1, 1, K, 1>;
+        using ShapeB = pto::Shape<1, 1, 1, Kt, -1>;
+        using StrideB = pto::Stride<1, 1, 1, L1, 1>;
+        using ShapeC = pto::Shape<1, 1, 1, -1, -1>;
+        using StrideC = pto::Stride<1, 1, 1, L1, 1>;
+        using MatTileA = pto::Tile<pto::TileType::Mat, data_T, Mt, Kt, pto::BLayout::ColMajor, -1, -1, pto::SLayout::RowMajor, 512>;
+        using MatTileB = pto::Tile<pto::TileType::Mat, data_T, Kt, Nt, pto::BLayout::ColMajor, -1, -1, pto::SLayout::RowMajor, 512>;
+        using LeftTileA = pto::TileLeft<data_T, Mt, Kt, -1, -1>;
+        using RightTileB = pto::TileRight<data_T, Kt, Nt, -1, -1>;
+        using AccTileC = pto::TileAcc<float, Mt, Nt, -1, -1>;
+
+        unsigned i = t / tiles_per_batch;
+        unsigned rem = t % tiles_per_batch;
+        unsigned row0 = (rem / nN) * Mt;  // output row offset within the matrix
+        unsigned col0 = (rem % nN) * Nt;  // output col offset within the matrix
+
+        // Boundary tiles see fewer real rows/cols than the padded tile (GM is
+        // L0xK / KxL1). row0 < L0 and col0 < L1 always hold for a full grid.
+        unsigned validM = (L0 - row0) < Mt ? (L0 - row0) : Mt;
+        unsigned validN = (L1 - col0) < Nt ? (L1 - col0) : Nt;
+
+        // Double buffering. The L1 Mat tiles are ping-ponged across two buffers
+        // so the GM->L1 load (MTE2, the slow stage) of the next K step overlaps
+        // the matmul (M) of the current step. The L0 Left/Right
+        // tiles stay single-buffered: a full Mt x Kt tile already fills L0A/L0B
+        // for the default tile, so two won't fit; the mov->matmul chain stays
+        // serialized but the expensive GM loads are hidden behind compute.
+        constexpr unsigned matBytesA = Mt * Kt * sizeof(data_T);
+        constexpr unsigned matBytesB = Kt * Nt * sizeof(data_T);
+        static_assert(2 * matBytesA + 2 * matBytesB <= 512u * 1024u,
+                      "Double-buffered L1 Mat tiles exceed the 512 KB CBUF.");
+
+        MatTileA matA[2];
+        MatTileB matB[2];
+        LeftTileA leftA;
+        RightTileB rightB;
+        AccTileC accC;
+
+        TASSIGN(matA[0], 0);
+        TASSIGN(matA[1], matBytesA);
+        TASSIGN(matB[0], 2 * matBytesA);
+        TASSIGN(matB[1], 2 * matBytesA + matBytesB);
+        TASSIGN(leftA, 0);
+        TASSIGN(rightB, 0);
+        TASSIGN(accC, 0);
+
+        // Valid extents are constant across the K-loop, so set them once.
+        matA[0].SetValidRow(validM); matA[0].SetValidCol(Kt);
+        matA[1].SetValidRow(validM); matA[1].SetValidCol(Kt);
+        matB[0].SetValidRow(Kt);     matB[0].SetValidCol(validN);
+        matB[1].SetValidRow(Kt);     matB[1].SetValidCol(validN);
+        leftA.SetValidRow(validM);   leftA.SetValidCol(Kt);
+        rightB.SetValidRow(Kt);      rightB.SetValidCol(validN);
+        accC.SetValidRow(validM);    accC.SetValidCol(validN);
+
+        // Event IDs (per L1 buffer where two can be in flight):
+        //   ID0/ID1  load-done   (MTE2 -> MTE1, RAW: mov waits its load)
+        //   ID2/ID3  matA free   (MTE1 -> MTE2, WAR: load waits prior mov)
+        //   ID4      mov-done    (MTE1 -> M,    RAW: matmul waits its mov)
+        //   ID5      leftA free  (M    -> MTE1, WAR: mov waits prior matmul)
+        // j is the local K-step (0..kCount-1); the global K-tile is kStart + j, so
+        // the accumulator-init (TMATMUL vs TMATMUL_ACC) keys on the local index.
+        for (unsigned j = 0; j < kCount; j++) {
+            unsigned p = j & 1;
+            event_t e_ld  = p ? EVENT_ID1 : EVENT_ID0;
+            event_t e_ldf = p ? EVENT_ID3 : EVENT_ID2;
+            unsigned k0 = (kStart + j) * Kt;
+            pto::GlobalTensor<data_T, ShapeA, StrideA> aGlobal(
+                const_cast<__gm__ data_T*>(ws0 + i * L0 * K + row0 * K + k0), ShapeA(validM));
+            pto::GlobalTensor<data_T, ShapeB, StrideB> bGlobal(
+                const_cast<__gm__ data_T*>(ws1 + i * K * L1 + k0 * L1 + col0), ShapeB(validN));
+
+            // Load GM -> L1 buffer p (wait until a prior mov freed this buffer).
+
+            if (j >= 2) wait_flag(PIPE_MTE1, PIPE_MTE2, e_ldf);
+
+            TLOAD(matA[p], aGlobal);
+            TLOAD(matB[p], bGlobal);
+
+            set_flag(PIPE_MTE2, PIPE_MTE1, e_ld);
+
+            // Move L1 -> L0 (single buffer): wait this load, and the prior matmul.
+
+            wait_flag(PIPE_MTE2, PIPE_MTE1, e_ld);
+            if (j >= 1) wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
+
+            TMOV(leftA, matA[p]);
+            TMOV(rightB, matB[p]);
+
+            set_flag(PIPE_MTE1, PIPE_MTE2, e_ldf);    // matA[p] free to reload
+            set_flag(PIPE_MTE1, PIPE_M, EVENT_ID4);   // leftA/rightB ready
+
+            // Matmul: first Kt step initialises the accumulator, the rest accumulate.
+
+            wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID4);
+
+            if (j == 0) {
+                TMATMUL(accC, leftA, rightB);
+            } else {
+                TMATMUL_ACC(accC, leftA, rightB);
+            }
+
+            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);   // leftA/rightB free
+
+        }
+
+        // Drain the WAR-free flags the final step(s) set but nothing consumed,
+        // so no flag state leaks into the next output tile.
+
+        if (kCount >= 2) {
+            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
+        } else {
+            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+        }
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
+
+        set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);   // RAW: the L0C store waits the matmul
+        wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+
+        pto::GlobalTensor<float, ShapeC, StrideC> cGlobal(
+            ws_res + i * L0 * L1 + row0 * L1 + col0, ShapeC(validM, validN));
+        if constexpr (ATOMIC) {
+            TSTORE<AccTileC, pto::GlobalTensor<float, ShapeC, StrideC>, pto::AtomicType::AtomicAdd>(cGlobal, accC);
+        } else {
+            TSTORE(cGlobal, accC);
+        }
+
+        set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);   // WAR: next tile's matmul reuses accC (L0C)
+        wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+}
+
 // Factored out so the standalone kernel and the fused kernel share it; the caller
 // guards with `if constexpr (DAV_CUBE)` and supplies the block index/count.
-template <typename data_T, typename CONFIG_T>
+// SPLITK enables the split-K schedule (see batched_matmul_inline body); it is off
+// for the standalone matmul and on only for fused configs with idle cores.
+template <typename data_T, typename CONFIG_T, bool SPLITK = false>
 AICORE inline void batched_matmul_inline(__gm__ const data_T* ws0, __gm__ const data_T* ws1,
                                          __gm__ float* ws_res, unsigned block_idx, unsigned block_num) {
         constexpr unsigned L0 = CONFIG_T::n_free0;
@@ -422,154 +577,41 @@ AICORE inline void batched_matmul_inline(__gm__ const data_T* ws0, __gm__ const 
         static_assert(M % Mt == 0 && N % Nt == 0 && K % Kt == 0,
                       "Tiling requires padded M/N/K divisible by the (clamped) tile size.");
 
-        constexpr unsigned nM = M / Mt;
-        constexpr unsigned nN = N / Nt;
         constexpr unsigned nK = K / Kt;
-        constexpr unsigned tiles_per_batch = nM * nN;
-        constexpr unsigned total_tiles = I * tiles_per_batch;
+        constexpr unsigned total_tiles = I * (M / Mt) * (N / Nt);
 
-        // Per-tile GM views. The ND->NZ loader takes its row/column transfer counts
-        // (nValue/dValue) directly from the GM Shape (not the tile's valid extents),
-        // so the Shape must describe the *real* data window, not the padded tile:
-        //   A: validM x Kt   (cols Kt are within the host-padded K, so always backed)
-        //   B: Kt     x validN
-        //   C: validM x validN
-        // The boundary row/col counts are runtime, hence DYNAMIC dims passed at
-        // construction. Row strides stay the full-matrix width (K / L1 / L1). Using
-        // the padded Mt/Nt here would over-read past the physical L0/L1 extent.
-        using ShapeA = pto::Shape<1, 1, 1, -1, Kt>;
-        using StrideA = pto::Stride<1, 1, 1, K, 1>;
-        using ShapeB = pto::Shape<1, 1, 1, Kt, -1>;
-        using StrideB = pto::Stride<1, 1, 1, L1, 1>;
-        using ShapeC = pto::Shape<1, 1, 1, -1, -1>;
-        using StrideC = pto::Stride<1, 1, 1, L1, 1>;
+        // Split-K. The output-tile grid is `total_tiles` units; the plain schedule
+        // hands one tile to each core, so when total_tiles < block_num the surplus
+        // cores idle (the dot product is the extreme: a single 1x1 tile over a long
+        // K runs entirely on one core). Split-K instead assigns `ksplit` cores to
+        // each tile, each contracting a disjoint K-slice and atomic-adding its
+        // partial into the (caller-pre-zeroed) output. ksplit is chosen at runtime
+        // from the real core count and clamped to a divisor of nK; ksplit==1 falls
+        // back to the plain path. Only enabled (SPLITK) for fused configs whose
+        // output is identity and tile grid is small — see einsum_fused_kernel.
+        if constexpr (SPLITK) {
+            unsigned ksplit = total_tiles ? block_num / total_tiles : 1u;
+            if (ksplit > nK) ksplit = nK;
+            while (ksplit > 1 && (nK % ksplit) != 0) ksplit--;
+            if (ksplit >= 2) {
+                unsigned total_work = total_tiles * ksplit;
+                if (block_idx < total_work) {
+                    unsigned kpc = nK / ksplit;        // K-tiles per slice
+                    unsigned t = block_idx / ksplit;   // which output tile
+                    unsigned s = block_idx % ksplit;   // which K-slice
+                    matmul_one_tile_inline<data_T, CONFIG_T, true>(ws0, ws1, ws_res, t, s * kpc, kpc);
+                }
+                return;
+            }
+            // ksplit == 1: no idle cores to exploit, use the plain schedule below.
+        }
 
-        // On-chip tiles: fixed tile dims, DYNAMIC valid extents set per output tile.
-        // ColMajor == NZ fractal; SLayout::RowMajor because the GM source is row-major.
-        using MatTileA = pto::Tile<pto::TileType::Mat, data_T, Mt, Kt, pto::BLayout::ColMajor, -1, -1, pto::SLayout::RowMajor, 512>;
-        using MatTileB = pto::Tile<pto::TileType::Mat, data_T, Kt, Nt, pto::BLayout::ColMajor, -1, -1, pto::SLayout::RowMajor, 512>;
-        using LeftTileA = pto::TileLeft<data_T, Mt, Kt, -1, -1>;
-        using RightTileB = pto::TileRight<data_T, Kt, Nt, -1, -1>;
-        using AccTileC = pto::TileAcc<float, Mt, Nt, -1, -1>;
-
+        // Plain schedule: block-distribute the output tiles, full K per tile.
         unsigned chunk = (total_tiles + block_num - 1) / block_num;
         unsigned start = block_idx * chunk;
         unsigned end = (start + chunk) < total_tiles ? (start + chunk) : total_tiles;
-
         for (unsigned t = start; t < end; t++) {
-            unsigned i = t / tiles_per_batch;
-            unsigned rem = t % tiles_per_batch;
-            unsigned row0 = (rem / nN) * Mt;  // output row offset within the matrix
-            unsigned col0 = (rem % nN) * Nt;  // output col offset within the matrix
-
-            // Boundary tiles see fewer real rows/cols than the padded tile (GM is
-            // L0xK / KxL1). row0 < L0 and col0 < L1 always hold for a full grid.
-            unsigned validM = (L0 - row0) < Mt ? (L0 - row0) : Mt;
-            unsigned validN = (L1 - col0) < Nt ? (L1 - col0) : Nt;
-
-            // Double buffering. The L1 Mat tiles are ping-ponged across two buffers
-            // so the GM->L1 load (MTE2, the slow stage) of the next K step overlaps
-            // the matmul (M) of the current step. The L0 Left/Right
-            // tiles stay single-buffered: a full Mt x Kt tile already fills L0A/L0B
-            // for the default tile, so two won't fit; the mov->matmul chain stays
-            // serialized but the expensive GM loads are hidden behind compute.
-            constexpr unsigned matBytesA = Mt * Kt * sizeof(data_T);
-            constexpr unsigned matBytesB = Kt * Nt * sizeof(data_T);
-            static_assert(2 * matBytesA + 2 * matBytesB <= 512u * 1024u,
-                          "Double-buffered L1 Mat tiles exceed the 512 KB CBUF.");
-
-            MatTileA matA[2];
-            MatTileB matB[2];
-            LeftTileA leftA;
-            RightTileB rightB;
-            AccTileC accC;
-
-            TASSIGN(matA[0], 0);
-            TASSIGN(matA[1], matBytesA);
-            TASSIGN(matB[0], 2 * matBytesA);
-            TASSIGN(matB[1], 2 * matBytesA + matBytesB);
-            TASSIGN(leftA, 0);
-            TASSIGN(rightB, 0);
-            TASSIGN(accC, 0);
-
-            // Valid extents are constant across the K-loop, so set them once.
-            matA[0].SetValidRow(validM); matA[0].SetValidCol(Kt);
-            matA[1].SetValidRow(validM); matA[1].SetValidCol(Kt);
-            matB[0].SetValidRow(Kt);     matB[0].SetValidCol(validN);
-            matB[1].SetValidRow(Kt);     matB[1].SetValidCol(validN);
-            leftA.SetValidRow(validM);   leftA.SetValidCol(Kt);
-            rightB.SetValidRow(Kt);      rightB.SetValidCol(validN);
-            accC.SetValidRow(validM);    accC.SetValidCol(validN);
-
-            // Event IDs (per L1 buffer where two can be in flight):
-            //   ID0/ID1  load-done   (MTE2 -> MTE1, RAW: mov waits its load)
-            //   ID2/ID3  matA free   (MTE1 -> MTE2, WAR: load waits prior mov)
-            //   ID4      mov-done    (MTE1 -> M,    RAW: matmul waits its mov)
-            //   ID5      leftA free  (M    -> MTE1, WAR: mov waits prior matmul)
-            for (unsigned k = 0; k < nK; k++) {
-                unsigned p = k & 1;
-                event_t e_ld  = p ? EVENT_ID1 : EVENT_ID0;
-                event_t e_ldf = p ? EVENT_ID3 : EVENT_ID2;
-                unsigned k0 = k * Kt;
-                pto::GlobalTensor<data_T, ShapeA, StrideA> aGlobal(
-                    const_cast<__gm__ data_T*>(ws0 + i * L0 * K + row0 * K + k0), ShapeA(validM));
-                pto::GlobalTensor<data_T, ShapeB, StrideB> bGlobal(
-                    const_cast<__gm__ data_T*>(ws1 + i * K * L1 + k0 * L1 + col0), ShapeB(validN));
-
-                // Load GM -> L1 buffer p (wait until a prior mov freed this buffer).
-
-                if (k >= 2) wait_flag(PIPE_MTE1, PIPE_MTE2, e_ldf);
-
-                TLOAD(matA[p], aGlobal);
-                TLOAD(matB[p], bGlobal);
-
-                set_flag(PIPE_MTE2, PIPE_MTE1, e_ld);
-
-                // Move L1 -> L0 (single buffer): wait this load, and the prior matmul.
-
-                wait_flag(PIPE_MTE2, PIPE_MTE1, e_ld);
-                if (k >= 1) wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
-
-                TMOV(leftA, matA[p]);
-                TMOV(rightB, matB[p]);
-
-                set_flag(PIPE_MTE1, PIPE_MTE2, e_ldf);    // matA[p] free to reload
-                set_flag(PIPE_MTE1, PIPE_M, EVENT_ID4);   // leftA/rightB ready
-
-                // Matmul: first Kt step initialises the accumulator, the rest accumulate.
-
-                wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID4);
-
-                if (k == 0) {
-                    TMATMUL(accC, leftA, rightB);
-                } else {
-                    TMATMUL_ACC(accC, leftA, rightB);
-                }
-
-                set_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);   // leftA/rightB free
-
-            }
-
-            // Drain the WAR-free flags the final step(s) set but nothing consumed,
-            // so no flag state leaks into the next output tile.
-
-            if constexpr (nK >= 2) {
-                wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
-                wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
-            } else {
-                wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
-            }
-            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
-
-            set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);   // RAW: the L0C store waits the matmul
-            wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
-
-            pto::GlobalTensor<float, ShapeC, StrideC> cGlobal(
-                ws_res + i * L0 * L1 + row0 * L1 + col0, ShapeC(validM, validN));
-            TSTORE(cGlobal, accC);
-
-            set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);   // WAR: next tile's matmul reuses accC (L0C)
-            wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+            matmul_one_tile_inline<data_T, CONFIG_T, false>(ws0, ws1, ws_res, t, 0, nK);
         }
 }
 
@@ -684,6 +726,27 @@ void transpose(const data_T* data, data_T* res, void* stream = nullptr) {
     transpose_kernel_standalone<data_T, CONFIG_T><<<core_num, nullptr, stream>>>(data, res);
 }
 
+// Split-K geometry, shared by the host-side eligibility check and the Cube-side
+// schedule so they agree on whether (and how many ways) a config is split. Mirrors
+// the padded-dim / tile-clamp / ksplit arithmetic in batched_matmul_inline.
+template <typename CONFIG_T>
+struct SplitK {
+    static constexpr unsigned L0 = CONFIG_T::n_free0;
+    static constexpr unsigned L1 = CONFIG_T::n_free1;
+    static constexpr unsigned C = CONFIG_T::n_contract;
+    static constexpr unsigned I = CONFIG_T::n_inplace;
+    static constexpr unsigned M = (L0 + 15) / 16 * 16;
+    static constexpr unsigned N = (L1 + 15) / 16 * 16;
+    static constexpr unsigned K = (C + 15) / 16 * 16;
+    static constexpr unsigned Mt = CONFIG_T::tile_m < M ? CONFIG_T::tile_m : M;
+    static constexpr unsigned Nt = CONFIG_T::tile_n < N ? CONFIG_T::tile_n : N;
+    static constexpr unsigned Kt = CONFIG_T::tile_k < K ? CONFIG_T::tile_k : K;
+    static constexpr unsigned nK = K / Kt;
+    static constexpr unsigned total_tiles = I * (M / Mt) * (N / Nt);
+    // The runtime ksplit (K-slices per tile) lives in batched_matmul_inline; here we
+    // only need the compile-time geometry that decides eligibility.
+};
+
 // ─── Fused single-kernel einsum ──────────────────────────────────────────────
 // One mix-kernel launch (AIC + AIV) runs the whole pipeline, with full
 // cross-core barriers between phases:
@@ -703,6 +766,15 @@ __global__ AICORE void einsum_fused_kernel(
         __gm__ data_T* ws0, __gm__ data_T* ws1, __gm__ float* ws_res,
         __gm__ float* res, uint64_t ffts_addr) {
     set_ffts_base_addr(ffts_addr);
+
+    constexpr bool OUT_IDENTITY = IsIdentityPerm<typename CONFIG_T::tpose_out_conf>::value;
+    // Split-K is enabled only when the output is identity (so the matmul target is
+    // `res`, which the host pre-zeros for these configs — see builder._splitk so the
+    // cores can atomic-add into it), there is K to split, and the output-tile grid
+    // is small enough to leave cores idle on the plain schedule. The runtime
+    // ksplit (>=2) gate inside collapses it to the plain path on small parts.
+    constexpr bool SPLITK_ELIGIBLE =
+        OUT_IDENTITY && (SplitK<CONFIG_T>::nK >= 2) && (SplitK<CONFIG_T>::total_tiles < 16);
 
     if constexpr (DAV_VEC) {
 
@@ -736,15 +808,15 @@ __global__ AICORE void einsum_fused_kernel(
         }
     }
 
-    constexpr bool OUT_IDENTITY = IsIdentityPerm<typename CONFIG_T::tpose_out_conf>::value;
-
     SyncAll<false>();  // inputs transposed -> matmul
 
     if constexpr (DAV_CUBE) {
         // Identity output: the matmul's natural layout already is res, so write it
-        // directly and skip the whole output-transpose pass below.
+        // directly and skip the whole output-transpose pass below. SPLITK_ELIGIBLE
+        // configs (identity, thin grid) hand idle cores K-slices that atomic-add
+        // into the pre-zeroed res.
         __gm__ float* mm_out = OUT_IDENTITY ? res : ws_res;
-        batched_matmul_inline<data_T, CONFIG_T>(ws0, ws1, mm_out, get_block_idx(), get_block_num());
+        batched_matmul_inline<data_T, CONFIG_T, SPLITK_ELIGIBLE>(ws0, ws1, mm_out, get_block_idx(), get_block_num());
     }
 
     if constexpr (!OUT_IDENTITY) {

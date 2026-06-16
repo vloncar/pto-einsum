@@ -51,6 +51,7 @@ class EinsumBuilder:
         self.code_hash = None
         self.target_dir = None
         self._workspace = None  # persistent NPU workspace (lazily allocated in run)
+        self._splitk = False    # split-K output needs zero-init (set in build())
 
     def _validate_einsum_expr(self, fn: str, shape0: tuple[int, ...], shape1: tuple[int, ...]):
         inp, out = map(str.strip, fn.split('->'))
@@ -215,22 +216,67 @@ class EinsumBuilder:
             config_name=name,
         )
 
-    def einsum_config_gen(self, tpose_inp0_name: str, tpose_inp1_name: str, tpose_out_name: str):
-        # Cube matmul tile sizes. A single configurable size (env EINSUM_TILE_SIZE,
-        # default 128) is used for all three dims; the kernel clamps each to its
-        # padded dim. Separate m/n/k fields are emitted to allow per-dim tuning later.
+    def _tile_k(self, tile: int, L0: int, L1: int, C: int) -> int:
+        # Pick the K-tile depth. tile_m/tile_n stay at the base `tile`; tile_k is
+        # grown as large as the on-chip buffers allow for *thin* problems (small
+        # padded M/N), which cuts the serial K-step count on the one core that owns
+        # the (few) output tiles. For square/large M,N the L0A/L0B caps below pin it
+        # back to `tile`, so this never changes the well-tuned matmul path.
+        #
+        # Caps (data_T operands live in L0A/L0B = 64 KB each; double-buffered Mat
+        # tiles share the 512 KB CBUF, matching the kernel's static_assert):
+        #   L0A : Mt*Kt*ds <= 64 KB,  L0B : Nt*Kt*ds <= 64 KB
+        #   CBUF: 2*(Mt+Nt)*Kt*ds <= 512 KB
+        # The result must divide the padded K so the kernel's K-tiling assert holds.
+        ds = 2 if self.dtype in (torch.float16, torch.bfloat16) else 4
+        pad16 = lambda x: (x + 15) // 16 * 16
+        Mpad, Npad, Kpad = pad16(L0), pad16(L1), pad16(C)
+        Mt, Nt = min(tile, Mpad), min(tile, Npad)
+        cap = min(65536 // (Mt * ds), 65536 // (Nt * ds),
+                  (512 * 1024) // (2 * (Mt + Nt) * ds), Kpad)
+        cap -= cap % 16  # keep fractal-aligned
+        # Largest divisor of Kpad that fits the cap (16 always divides Kpad).
+        for d in range(cap, 15, -16):
+            if Kpad % d == 0:
+                return d
+        return 16
+
+    def _splitk_eligible(self) -> bool:
+        # Mirror einsum_fused_kernel's SPLITK_ELIGIBLE: the kernel splits a tile's
+        # K-contraction across otherwise-idle cores, which atomic-add their slices
+        # into the output, so the host must pre-zero it. Enabled for identity-output
+        # (matmul writes res directly), splittable K (nK >= 2), and a tile grid small
+        # enough to leave cores idle. Must stay in lockstep with the kernel constant.
+        L0, L1, C, I = self.recipe['L0'], self.recipe['L1'], self.recipe['C'], self.recipe['I']
+        perm = tuple(self.recipe['out_transpose_idxs'])
+        out_identity = perm == tuple(range(len(perm)))
+        pad16 = lambda x: (x + 15) // 16 * 16
+        Mpad, Npad, Kpad = pad16(L0), pad16(L1), pad16(C)
         tile = int(os.getenv("EINSUM_TILE_SIZE", "128"))
+        Mt, Nt = min(tile, Mpad), min(tile, Npad)
+        Kt = self._tile_k(tile, L0, L1, C)
+        nK = Kpad // Kt
+        total_tiles = I * (Mpad // Mt) * (Npad // Nt)
+        return out_identity and nK >= 2 and total_tiles < 16
+
+    def einsum_config_gen(self, tpose_inp0_name: str, tpose_inp1_name: str, tpose_out_name: str):
+        # Cube matmul tile sizes. A single base size (env EINSUM_TILE_SIZE, default
+        # 128) drives tile_m/tile_n; tile_k is tuned per-problem (see _tile_k) to
+        # speed up thin/large-K contractions like the dot product. The kernel clamps
+        # each tile to its padded dim.
+        tile = int(os.getenv("EINSUM_TILE_SIZE", "128"))
+        L0, L1, C = self.recipe['L0'], self.recipe['L1'], self.recipe['C']
         return dict(
             tpose_inp0_name=tpose_inp0_name,
             tpose_inp1_name=tpose_inp1_name,
             tpose_out_name=tpose_out_name,
-            n_free0=self.recipe['L0'],
-            n_free1=self.recipe['L1'],
-            n_contract=self.recipe['C'],
+            n_free0=L0,
+            n_free1=L1,
+            n_contract=C,
             n_inplace=self.recipe['I'],
             tile_m=tile,
             tile_n=tile,
-            tile_k=tile,
+            tile_k=self._tile_k(tile, L0, L1, C),
         )
 
     def parse_equation(self):
@@ -437,6 +483,10 @@ extern "C" {{
         self.compile()
         self.load_library()
 
+        # Split-K configs have the cores atomic-add into the output, so it must start
+        # zeroed (see _splitk_eligible). self.recipe is populated by generate_code().
+        self._splitk = self._splitk_eligible()
+
         # Return a Callable wrapper that validates inputs
         def run(*operands):
             if len(operands) != 2:
@@ -462,6 +512,12 @@ extern "C" {{
             if self.device == "cpu":
                 output_tensor_npu = torch.zeros(self.recipe['out_interpret_shape'], dtype=torch.float32, device="cpu")
                 stream_ptr = None
+            elif self._splitk:
+                # Split-K cores atomic-add their K-slices into the output, so it must
+                # start zeroed. torch.zeros runs on the same stream before the kernel,
+                # so ordering holds without an explicit sync.
+                output_tensor_npu = torch.zeros(self.recipe['out_interpret_shape'], dtype=torch.float32, device="npu")
+                stream_ptr = torch.npu.current_stream()._as_parameter_
             else:
                 # The kernel writes every output element, so skip zero-init.
                 output_tensor_npu = torch.empty(self.recipe['out_interpret_shape'], dtype=torch.float32, device="npu")

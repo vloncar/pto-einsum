@@ -88,6 +88,30 @@ and both the second barrier and Phase C are dropped (`if constexpr`). `ws_res` i
 then never read, so `einsum_setup` skips allocating it. This removes a whole Vec
 copy pass, one cross-core barrier, and the output buffer for the typical matmul.
 
+**Adaptive `tile_k`.** `builder._tile_k` grows the K-tile depth (`tile_m`/`tile_n`
+stay at the base 128) as large as the on-chip buffers allow for *thin* problems
+(small padded M/N) — `Mt·Kt·ds ≤ 64 KB` (L0A), `Nt·Kt·ds ≤ 64 KB` (L0B),
+`2(Mt+Nt)·Kt·ds ≤ 512 KB` (CBUF) — picking the largest divisor of padded `K` that
+fits. For square/large M,N those caps pin it back to 128, so the tuned matmul path
+is unchanged; for a long-`K` reduction it cuts the serial K-step count.
+
+**Split-K (`batched_matmul_inline`, `SplitK<CONFIG_T>`).** The output-tile grid is
+`total_tiles = I·⌈L0/Mt⌉·⌈L1/Nt⌉`; the plain schedule gives one tile per core, so
+when `total_tiles < block_num` the surplus cores idle (the dot product `i,i->` is
+the extreme — a single 1×1 tile over a long K runs on *one* of ~20 cores). Split-K
+instead assigns `ksplit = block_num/total_tiles` cores to each tile, each
+contracting a disjoint K-slice (`matmul_one_tile_inline` over `[kStart, kStart+kpc)`)
+and **atomic-adding** (`TSTORE<…,AtomicType::AtomicAdd>`) its partial into the
+output. `ksplit` is chosen at runtime, clamped to a divisor of `nK`; `ksplit==1`
+falls back to the plain path. It is enabled (`SPLITK_ELIGIBLE`, compile-time) only
+for identity outputs with `nK ≥ 2` and `total_tiles < 16`. Because several cores
+atomic-add into the output it must start zeroed: the host does this
+(`builder._splitk_eligible` → `torch.zeros`), *not* the kernel — an in-kernel Vec
+zero-store is **not** coherent with the Cube's fixpipe atomic RMW across `SyncAll`
+(the MTE3→FIX path differs from the MTE3→MTE2 path the input transposes rely on),
+which silently corrupts results; a kernel boundary (the `torch.zeros` launch) is a
+full GM sync and fixes it. Net: the dot product drops ~1.9 ms → ~0.19 ms (~10×).
+
 The host fetches the FFTS control address (`rtGetC2cCtrlAddr`, forward-declared to
 avoid a profiling-header dependency; link `-lruntime`) and the kernel calls
 `set_ffts_base_addr` before the barriers. Vector work is distributed over
