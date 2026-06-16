@@ -398,6 +398,29 @@ AICORE inline void transpose_2d_inline(__gm__ const data_T* src, __gm__ data_T* 
 // a partial valid extent on boundary tiles (GM is L0xK / KxL1, not padded),
 // handled via SetValidRow/SetValidCol.
 //
+// Padded matmul geometry, the single source of truth shared by the per-tile
+// kernel, the batched scheduler, and the host/kernel split-K eligibility check, so
+// they all agree on the padded dims, tile clamps, tile counts, and split-K
+// geometry. Mirrors the fractal-alignment (M/K/N = ⌈dim/16⌉·16) and tile-clamp
+// (min(config, padded-dim)) rules described in Phase B.
+template <typename CONFIG_T>
+struct MatmulGeom {
+    static constexpr unsigned L0 = CONFIG_T::n_free0;
+    static constexpr unsigned L1 = CONFIG_T::n_free1;
+    static constexpr unsigned C  = CONFIG_T::n_contract;
+    static constexpr unsigned I  = CONFIG_T::n_inplace;
+    static constexpr unsigned M  = (L0 + 15) / 16 * 16;
+    static constexpr unsigned N  = (L1 + 15) / 16 * 16;
+    static constexpr unsigned K  = (C + 15) / 16 * 16;
+    static constexpr unsigned Mt = CONFIG_T::tile_m < M ? CONFIG_T::tile_m : M;
+    static constexpr unsigned Nt = CONFIG_T::tile_n < N ? CONFIG_T::tile_n : N;
+    static constexpr unsigned Kt = CONFIG_T::tile_k < K ? CONFIG_T::tile_k : K;
+    static constexpr unsigned nN = N / Nt;
+    static constexpr unsigned nK = K / Kt;
+    static constexpr unsigned tiles_per_batch = (M / Mt) * nN;
+    static constexpr unsigned total_tiles = I * tiles_per_batch;
+};
+
 // One output tile: contract the K-tile range [kStart, kStart+kCount) of tile `t`
 // and store the result. ATOMIC selects an atomic-add store — used by split-K, where
 // several cores each contract a disjoint K-slice of the same tile into a pre-zeroed
@@ -406,17 +429,15 @@ template <typename data_T, typename CONFIG_T, bool ATOMIC>
 AICORE inline void matmul_one_tile_inline(__gm__ const data_T* ws0, __gm__ const data_T* ws1,
                                           __gm__ float* ws_res, unsigned t,
                                           unsigned kStart, unsigned kCount) {
-        constexpr unsigned L0 = CONFIG_T::n_free0;
-        constexpr unsigned L1 = CONFIG_T::n_free1;
-        constexpr unsigned C = CONFIG_T::n_contract;
-        constexpr unsigned M = (L0 + 15) / 16 * 16;
-        constexpr unsigned K = (C + 15) / 16 * 16;
-        constexpr unsigned N = (L1 + 15) / 16 * 16;
-        constexpr unsigned Mt = CONFIG_T::tile_m < M ? CONFIG_T::tile_m : M;
-        constexpr unsigned Nt = CONFIG_T::tile_n < N ? CONFIG_T::tile_n : N;
-        constexpr unsigned Kt = CONFIG_T::tile_k < K ? CONFIG_T::tile_k : K;
-        constexpr unsigned nN = N / Nt;
-        constexpr unsigned tiles_per_batch = (M / Mt) * nN;
+        using G = MatmulGeom<CONFIG_T>;
+        constexpr unsigned L0 = G::L0;
+        constexpr unsigned L1 = G::L1;
+        constexpr unsigned K  = G::K;
+        constexpr unsigned Mt = G::Mt;
+        constexpr unsigned Nt = G::Nt;
+        constexpr unsigned Kt = G::Kt;
+        constexpr unsigned nN = G::nN;
+        constexpr unsigned tiles_per_batch = G::tiles_per_batch;
 
         using ShapeA = pto::Shape<1, 1, 1, -1, Kt>;
         using StrideA = pto::Stride<1, 1, 1, K, 1>;
@@ -528,12 +549,8 @@ AICORE inline void matmul_one_tile_inline(__gm__ const data_T* ws0, __gm__ const
         // Drain the WAR-free flags the final step(s) set but nothing consumed,
         // so no flag state leaks into the next output tile.
 
-        if (kCount >= 2) {
-            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
-            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
-        } else {
-            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
-        }
+        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+        if (kCount >= 2) wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
         wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
 
         set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);   // RAW: the L0C store waits the matmul
@@ -558,27 +575,14 @@ AICORE inline void matmul_one_tile_inline(__gm__ const data_T* ws0, __gm__ const
 template <typename data_T, typename CONFIG_T, bool SPLITK = false>
 AICORE inline void batched_matmul_inline(__gm__ const data_T* ws0, __gm__ const data_T* ws1,
                                          __gm__ float* ws_res, unsigned block_idx, unsigned block_num) {
-        constexpr unsigned L0 = CONFIG_T::n_free0;
-        constexpr unsigned L1 = CONFIG_T::n_free1;
-        constexpr unsigned C = CONFIG_T::n_contract;
-        constexpr unsigned I = CONFIG_T::n_inplace;
-
-        // Padded (fractal-aligned) problem dims.
-        constexpr unsigned M = (L0 + 15) / 16 * 16;
-        constexpr unsigned K = (C + 15) / 16 * 16;
-        constexpr unsigned N = (L1 + 15) / 16 * 16;
-
-        // Tile sizes, clamped to the padded dim (config sizes are multiples of 16).
-        constexpr unsigned Mt = CONFIG_T::tile_m < M ? CONFIG_T::tile_m : M;
-        constexpr unsigned Nt = CONFIG_T::tile_n < N ? CONFIG_T::tile_n : N;
-        constexpr unsigned Kt = CONFIG_T::tile_k < K ? CONFIG_T::tile_k : K;
+        using G = MatmulGeom<CONFIG_T>;
 
         // Full tile grid only (no partial tiles).
-        static_assert(M % Mt == 0 && N % Nt == 0 && K % Kt == 0,
+        static_assert(G::M % G::Mt == 0 && G::N % G::Nt == 0 && G::K % G::Kt == 0,
                       "Tiling requires padded M/N/K divisible by the (clamped) tile size.");
 
-        constexpr unsigned nK = K / Kt;
-        constexpr unsigned total_tiles = I * (M / Mt) * (N / Nt);
+        constexpr unsigned nK = G::nK;
+        constexpr unsigned total_tiles = G::total_tiles;
 
         // Split-K. The output-tile grid is `total_tiles` units; the plain schedule
         // hands one tile to each core, so when total_tiles < block_num the surplus
@@ -726,27 +730,6 @@ void transpose(const data_T* data, data_T* res, void* stream = nullptr) {
     transpose_kernel_standalone<data_T, CONFIG_T><<<core_num, nullptr, stream>>>(data, res);
 }
 
-// Split-K geometry, shared by the host-side eligibility check and the Cube-side
-// schedule so they agree on whether (and how many ways) a config is split. Mirrors
-// the padded-dim / tile-clamp / ksplit arithmetic in batched_matmul_inline.
-template <typename CONFIG_T>
-struct SplitK {
-    static constexpr unsigned L0 = CONFIG_T::n_free0;
-    static constexpr unsigned L1 = CONFIG_T::n_free1;
-    static constexpr unsigned C = CONFIG_T::n_contract;
-    static constexpr unsigned I = CONFIG_T::n_inplace;
-    static constexpr unsigned M = (L0 + 15) / 16 * 16;
-    static constexpr unsigned N = (L1 + 15) / 16 * 16;
-    static constexpr unsigned K = (C + 15) / 16 * 16;
-    static constexpr unsigned Mt = CONFIG_T::tile_m < M ? CONFIG_T::tile_m : M;
-    static constexpr unsigned Nt = CONFIG_T::tile_n < N ? CONFIG_T::tile_n : N;
-    static constexpr unsigned Kt = CONFIG_T::tile_k < K ? CONFIG_T::tile_k : K;
-    static constexpr unsigned nK = K / Kt;
-    static constexpr unsigned total_tiles = I * (M / Mt) * (N / Nt);
-    // The runtime ksplit (K-slices per tile) lives in batched_matmul_inline; here we
-    // only need the compile-time geometry that decides eligibility.
-};
-
 // ─── Fused single-kernel einsum ──────────────────────────────────────────────
 // One mix-kernel launch (AIC + AIV) runs the whole pipeline, with full
 // cross-core barriers between phases:
@@ -774,7 +757,7 @@ __global__ AICORE void einsum_fused_kernel(
     // is small enough to leave cores idle on the plain schedule. The runtime
     // ksplit (>=2) gate inside collapses it to the plain path on small parts.
     constexpr bool SPLITK_ELIGIBLE =
-        OUT_IDENTITY && (SplitK<CONFIG_T>::nK >= 2) && (SplitK<CONFIG_T>::total_tiles < 16);
+        OUT_IDENTITY && (MatmulGeom<CONFIG_T>::nK >= 2) && (MatmulGeom<CONFIG_T>::total_tiles < 16);
 
     if constexpr (DAV_VEC) {
 
@@ -828,31 +811,6 @@ __global__ AICORE void einsum_fused_kernel(
             transpose_inline<float, typename CONFIG_T::tpose_out_conf>(ws_res, res, lane, nlanes);
         }
     }
-}
-
-// Multi-launch einsum (4 separate kernels). No longer on the default dispatch
-// path — the fused kernel now covers every supported config — but retained as a
-// reference / debugging fallback. It host-pads the contraction via batched_matmul.
-template <typename data_T, typename CONFIG_T>
-void einsum_multilaunch(const data_T* data0, const data_T* data1, float* res, void* stream) {
-    size_t ws_size = sizeof(data_T) * CONFIG_T::tpose_inp0_config::N +
-                     sizeof(data_T) * CONFIG_T::tpose_inp1_config::N +
-                     sizeof(float) * CONFIG_T::tpose_out_conf::N;
-
-    void* workspace = nullptr;
-    aclrtMalloc(&workspace, ws_size, ACL_MEM_MALLOC_NORMAL_ONLY);
-
-    data_T* ws0 = reinterpret_cast<data_T*>(workspace);
-    data_T* ws1 = reinterpret_cast<data_T*>(ws0 + CONFIG_T::tpose_inp0_config::N);
-    float* ws_res = reinterpret_cast<float*>(ws1 + CONFIG_T::tpose_inp1_config::N);
-
-    transpose<data_T, typename CONFIG_T::tpose_inp0_config>(data0, ws0, stream);
-    transpose<data_T, typename CONFIG_T::tpose_inp1_config>(data1, ws1, stream);
-    batched_matmul<data_T, CONFIG_T>(ws0, ws1, ws_res, stream);
-    transpose<float, typename CONFIG_T::tpose_out_conf>(ws_res, res, stream);
-
-    aclrtSynchronizeStream(stream);
-    aclrtFree(workspace);
 }
 
 // The whole transpose -> matmul -> transpose pipeline runs as a single fused

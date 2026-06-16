@@ -221,10 +221,10 @@ non-reusing callers.
 
 Part 1 §Phase B requires a `K`-wide, zero-padded A and `K`-row, zero-padded B. The
 naive way to get them is a host-side `malloc`/`memcpy2d`/stream-sync between
-transpose and matmul (this is what the retained `batched_matmul` /
-`einsum_multilaunch` reference path still does). The fused kernel instead allocates
-`ws0`/`ws1` K-padded, zeroes them once (§2.1), and the **input transposes write the
-padded layout directly**:
+transpose and matmul (this is what the standalone `batched_matmul` host function
+still does — kept as a reference path, exercised by `test_split_npu.py`). The fused
+kernel instead allocates `ws0`/`ws1` K-padded, zeroes them once (§2.1), and the
+**input transposes write the padded layout directly**:
 
 - `ws0` (`A`): the contract dim is innermost, so the input0 transpose pads it from
   `C` to `K` per row via a `DST_PAD` template arg (2D `TTRANS` path) or
@@ -239,8 +239,7 @@ padded layout directly**:
 
 This removes the mid-pipeline `malloc`/`memcpy`/stream-sync — a ~21× speedup on
 the degenerate outer-product case. The fused path covers every supported config
-(`K==C` and `K!=C`, each with any batch count); the multi-launch path is retained
-only as a reference / debugging fallback and is no longer on the default dispatch.
+(`K==C` and `K!=C`, each with any batch count).
 
 ## 2.3 Identity-output fast path (skip Phase C)
 
