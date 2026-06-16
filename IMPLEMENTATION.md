@@ -81,6 +81,13 @@ The phases are separated by full cross-core barriers (`SyncAll<false>()`):
 [Vec ]  Phase C: transpose ws_res->res
 ```
 
+**Identity-output fast path.** When the output permutation is identity
+(`IsIdentityPerm<tpose_out_conf>` — `ij,jk->ik`, `bij,bjk->bik`, … the common
+case) Phase C is a plain copy, so the Cube writes its result **straight to `res`**
+and both the second barrier and Phase C are dropped (`if constexpr`). `ws_res` is
+then never read, so `einsum_setup` skips allocating it. This removes a whole Vec
+copy pass, one cross-core barrier, and the output buffer for the typical matmul.
+
 The host fetches the FFTS control address (`rtGetC2cCtrlAddr`, forward-declared to
 avoid a profiling-header dependency; link `-lruntime`) and the kernel calls
 `set_ffts_base_addr` before the barriers. Vector work is distributed over

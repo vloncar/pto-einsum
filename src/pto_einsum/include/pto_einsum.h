@@ -693,6 +693,10 @@ void transpose(const data_T* data, data_T* res, void* stream = nullptr) {
 //   -- SyncAll<false>() --   Cube -> Vec
 //   [Vec ]  Phase C: transpose ws_res->res
 // Vec distributes work over block_num*2 sub-block lanes; Cube over block_num.
+//
+// When the output permutation is identity (ij,jk->ik, bij,bjk->bik, … — the common
+// case) Phase C is a plain copy, so the Cube writes straight to res and the second
+// barrier + Phase C are dropped entirely (and ws_res is not even allocated).
 template <typename data_T, typename CONFIG_T>
 __global__ AICORE void einsum_fused_kernel(
         __gm__ const data_T* data0, __gm__ const data_T* data1,
@@ -732,18 +736,25 @@ __global__ AICORE void einsum_fused_kernel(
         }
     }
 
+    constexpr bool OUT_IDENTITY = IsIdentityPerm<typename CONFIG_T::tpose_out_conf>::value;
+
     SyncAll<false>();  // inputs transposed -> matmul
 
     if constexpr (DAV_CUBE) {
-        batched_matmul_inline<data_T, CONFIG_T>(ws0, ws1, ws_res, get_block_idx(), get_block_num());
+        // Identity output: the matmul's natural layout already is res, so write it
+        // directly and skip the whole output-transpose pass below.
+        __gm__ float* mm_out = OUT_IDENTITY ? res : ws_res;
+        batched_matmul_inline<data_T, CONFIG_T>(ws0, ws1, mm_out, get_block_idx(), get_block_num());
     }
 
-    SyncAll<false>();  // matmul done -> output transpose
+    if constexpr (!OUT_IDENTITY) {
+        SyncAll<false>();  // matmul done -> output transpose
 
-    if constexpr (DAV_VEC) {
-        unsigned lane = get_block_idx() * 2 + get_subblockid();
-        unsigned nlanes = get_block_num() * 2;
-        transpose_inline<float, typename CONFIG_T::tpose_out_conf>(ws_res, res, lane, nlanes);
+        if constexpr (DAV_VEC) {
+            unsigned lane = get_block_idx() * 2 + get_subblockid();
+            unsigned nlanes = get_block_num() * 2;
+            transpose_inline<float, typename CONFIG_T::tpose_out_conf>(ws_res, res, lane, nlanes);
+        }
     }
 }
 
@@ -804,7 +815,9 @@ void* einsum_setup(void* stream = nullptr) {
     const size_t ws1_elems = einsum_ws1_elems<data_T, CONFIG_T>();
     const size_t ws0_bytes = sizeof(data_T) * ws0_elems;
     const size_t ws1_bytes = sizeof(data_T) * ws1_elems;
-    const size_t wsr_bytes = sizeof(float) * CONFIG_T::tpose_out_conf::N;
+    // Identity output writes straight to res, so ws_res is never read — don't alloc it.
+    constexpr bool OUT_IDENTITY = IsIdentityPerm<typename CONFIG_T::tpose_out_conf>::value;
+    const size_t wsr_bytes = OUT_IDENTITY ? 0 : sizeof(float) * CONFIG_T::tpose_out_conf::N;
 
     void* workspace = nullptr;
     aclrtMalloc(&workspace, ws0_bytes + ws1_bytes + wsr_bytes, ACL_MEM_MALLOC_NORMAL_ONLY);
