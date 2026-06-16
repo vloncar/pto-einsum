@@ -1,5 +1,6 @@
 import time
 import os
+import statistics
 import torch
 from pto_einsum import EinsumBuilder
 
@@ -129,23 +130,22 @@ def run_benchmark():
             _ = torch.einsum(eq, inp0, inp1)
         torch.npu.synchronize()
 
-        # 2. Benchmark Custom JIT C++ Execution
-        t_custom_total = 0.0
+        # 2. Benchmark both implementations, interleaved per iteration.
+        custom_samples = []
+        torch_samples = []
         for _ in range(runs):
             t_start = time.perf_counter()
             _ = runner(inp0, inp1)
             torch.npu.synchronize()
-            t_custom_total += (time.perf_counter() - t_start)
-        avg_custom_ms = (t_custom_total / runs) * 1000.0
+            custom_samples.append((time.perf_counter() - t_start) * 1000.0)
 
-        # 3. Benchmark Native PyTorch NPU Execution
-        t_torch_total = 0.0
-        for _ in range(runs):
             t_start = time.perf_counter()
             _ = torch.einsum(eq, inp0, inp1)
             torch.npu.synchronize()
-            t_torch_total += (time.perf_counter() - t_start)
-        avg_torch_ms = (t_torch_total / runs) * 1000.0
+            torch_samples.append((time.perf_counter() - t_start) * 1000.0)
+
+        avg_custom_ms = statistics.median(custom_samples)
+        avg_torch_ms = statistics.median(torch_samples)
 
         # Release ctypes lock and clean up build artifacts
         runner = None
