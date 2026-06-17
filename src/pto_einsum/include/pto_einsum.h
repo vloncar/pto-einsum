@@ -398,10 +398,12 @@ struct MatmulGeom {
     static constexpr unsigned total_tiles = I * tiles_per_batch;
 };
 
-// One output tile: contract the K-tile range [kStart, kStart+kCount) of tile `t`
-// and store the result. ATOMIC selects an atomic-add store — used by split-K, where
-// several cores each contract a disjoint K-slice of the same tile into a pre-zeroed
-// output — versus a plain overwriting store for the one-core-per-tile case.
+// One output tile, basic per-Kt schedule: contract the K-tile range
+// [kStart, kStart+kCount) of tile `t` and store the result. This is the split-K
+// tile (the plain schedule uses the deeper-pipelined matmul_one_tile_deep below).
+// ATOMIC selects an atomic-add store — used by split-K, where several cores each
+// contract a disjoint K-slice of the same tile into a pre-zeroed output — versus a
+// plain overwriting store.
 template <typename data_T, typename CONFIG_T, bool ATOMIC>
 AICORE inline void matmul_one_tile_inline(__gm__ const data_T* ws0, __gm__ const data_T* ws1,
                                           __gm__ float* ws_res, unsigned t,
@@ -545,6 +547,212 @@ AICORE inline void matmul_one_tile_inline(__gm__ const data_T* ws0, __gm__ const
         wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 }
 
+// Deep-pipeline granularities for matmul_one_tile_deep, derived at compile time
+// from the tile dims and dtype size. Kq is the L0 compute granularity: the largest
+// multiple of 16 dividing K whose ping-pong Left/Right tiles fit their 64 KB L0
+// banks. Kd is the L1 chunk depth: the largest multiple of Kq dividing K whose
+// double-buffered A+B Mat tiles fit the 512 KB CBUF. Both divide K exactly, so the
+// chunk loop (K/Kd) and phase loop (Kd/Kq) are clean; awkward/small K collapses
+// gracefully to Kd==Kq==K (a single chunk, single phase = the plain matmul).
+AICORE inline constexpr unsigned deep_pick_kq(unsigned Mt, unsigned Nt, unsigned K, unsigned ds) {
+    unsigned capA = 65536u / (2u * Mt * ds);
+    unsigned capB = 65536u / (2u * Nt * ds);
+    unsigned cap = capA < capB ? capA : capB;
+    cap -= cap % 16u;
+    if (cap > K) cap = K;
+    if (cap < 16u) return 16u;
+    for (unsigned d = cap; d >= 16u; d -= 16u)
+        if (K % d == 0u) return d;
+    return 16u;
+}
+AICORE inline constexpr unsigned deep_pick_kd(unsigned Mt, unsigned Nt, unsigned K, unsigned Kq, unsigned ds) {
+    unsigned cap = (512u * 1024u) / (2u * (Mt + Nt) * ds);
+    cap -= cap % Kq;
+    if (cap > K) cap = K;
+    if (cap < Kq) return Kq;
+    for (unsigned d = cap; d >= Kq; d -= Kq)
+        if (K % d == 0u) return d;
+    return Kq;
+}
+
+// One output tile, deep-pipelined — the compute schedule from the pto-kernels
+// matmul-swizzle example, ported and generalized to fp32/fp16 and the einsum's
+// padded/batched shapes (the example's L2 tile-swizzle was not kept — it measured a
+// no-op/regression here). It always contracts the full K [0, K) internally, so it
+// slots straight into the plain schedule; the split-K path keeps matmul_one_tile_inline.
+//
+// Two overlap mechanisms hide the memory pipes behind the cube, which the basic
+// per-Kt routine (single-buffered L0, serialized TMOV->TMATMUL) does not:
+//   1. L1 chunk reuse: A [Mt,Kd] and B [Kd,Nt] are loaded once per Kd-chunk and
+//      TEXTRACTed into nP=Kd/Kq L0 sub-tiles, amortizing the big GM->L1 transfers.
+//   2. L0 ping-pong: the L0 Left/Right tiles double-buffer, so the TEXTRACT of the
+//      next phase (MTE1) overlaps the TMATMUL of the current phase (M) instead of
+//      serializing. The L1 A/B chunks also double-buffer to prefetch chunk c+1's
+//      GM->L1 load under chunk c's compute.
+// Each tile is self-contained (inits its event flags, drains them before the
+// store), so the scheduler can hand tiles to cores in any order.
+template <typename data_T, typename CONFIG_T>
+AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const data_T* ws1,
+                                        __gm__ float* ws_res, unsigned t) {
+        using G = MatmulGeom<CONFIG_T>;
+        constexpr unsigned L0 = G::L0;
+        constexpr unsigned L1 = G::L1;
+        constexpr unsigned K  = G::K;
+        constexpr unsigned Mt = G::Mt;
+        constexpr unsigned Nt = G::Nt;
+        constexpr unsigned nN = G::nN;
+        constexpr unsigned tiles_per_batch = G::tiles_per_batch;
+
+        constexpr unsigned ds  = sizeof(data_T);
+        constexpr unsigned Kq  = deep_pick_kq(Mt, Nt, K, ds);
+        constexpr unsigned Kd  = deep_pick_kd(Mt, Nt, K, Kq, ds);
+        constexpr unsigned nKd = K / Kd;   // L1 chunk count
+        constexpr unsigned nP  = Kd / Kq;  // L0 phases per chunk
+
+        using ShapeA = pto::Shape<1, 1, 1, -1, Kd>;
+        using StrideA = pto::Stride<1, 1, 1, K, 1>;
+        using ShapeB = pto::Shape<1, 1, 1, Kd, -1>;
+        using StrideB = pto::Stride<1, 1, 1, L1, 1>;
+        using ShapeC = pto::Shape<1, 1, 1, -1, -1>;
+        using StrideC = pto::Stride<1, 1, 1, L1, 1>;
+        using MatTileA = pto::Tile<pto::TileType::Mat, data_T, Mt, Kd, pto::BLayout::ColMajor, -1, -1, pto::SLayout::RowMajor, 512>;
+        using MatTileB = pto::Tile<pto::TileType::Mat, data_T, Kd, Nt, pto::BLayout::ColMajor, -1, -1, pto::SLayout::RowMajor, 512>;
+        using LeftTileA = pto::TileLeft<data_T, Mt, Kq, -1, -1>;
+        using RightTileB = pto::TileRight<data_T, Kq, Nt, -1, -1>;
+        using AccTileC = pto::TileAcc<float, Mt, Nt, -1, -1>;
+
+        unsigned i = t / tiles_per_batch;
+        unsigned rem = t % tiles_per_batch;
+        unsigned row0 = (rem / nN) * Mt;
+        unsigned col0 = (rem % nN) * Nt;
+        unsigned validM = (L0 - row0) < Mt ? (L0 - row0) : Mt;
+        unsigned validN = (L1 - col0) < Nt ? (L1 - col0) : Nt;
+
+        constexpr unsigned matBytesA = Mt * Kd * ds;
+        constexpr unsigned matBytesB = Kd * Nt * ds;
+        static_assert(2 * matBytesA + 2 * matBytesB <= 512u * 1024u,
+                      "Deep-pipeline L1 A/B chunks exceed the 512 KB CBUF.");
+        constexpr unsigned l0aBytes = Mt * Kq * ds;
+        constexpr unsigned l0bBytes = Kq * Nt * ds;
+        static_assert(2 * l0aBytes <= 64u * 1024u, "Deep-pipeline L0A ping-pong exceeds L0A.");
+        static_assert(2 * l0bBytes <= 64u * 1024u, "Deep-pipeline L0B ping-pong exceeds L0B.");
+
+        MatTileA a_l1[2];
+        MatTileB b_l1[2];
+        LeftTileA a_l0[2];
+        RightTileB b_l0[2];
+        AccTileC c_l0;
+        TASSIGN(a_l1[0], 0);
+        TASSIGN(a_l1[1], matBytesA);
+        TASSIGN(b_l1[0], 2 * matBytesA);
+        TASSIGN(b_l1[1], 2 * matBytesA + matBytesB);
+        TASSIGN(a_l0[0], 0);
+        TASSIGN(a_l0[1], l0aBytes);
+        TASSIGN(b_l0[0], 0);
+        TASSIGN(b_l0[1], l0bBytes);
+        TASSIGN(c_l0, 0);
+
+        a_l1[0].SetValidRow(validM); a_l1[0].SetValidCol(Kd);
+        a_l1[1].SetValidRow(validM); a_l1[1].SetValidCol(Kd);
+        b_l1[0].SetValidRow(Kd);     b_l1[0].SetValidCol(validN);
+        b_l1[1].SetValidRow(Kd);     b_l1[1].SetValidCol(validN);
+        a_l0[0].SetValidRow(validM); a_l0[0].SetValidCol(Kq);
+        a_l0[1].SetValidRow(validM); a_l0[1].SetValidCol(Kq);
+        b_l0[0].SetValidRow(Kq);     b_l0[0].SetValidCol(validN);
+        b_l0[1].SetValidRow(Kq);     b_l0[1].SetValidCol(validN);
+        c_l0.SetValidRow(validM);    c_l0.SetValidCol(validN);
+
+        const __gm__ data_T* aBase = ws0 + i * L0 * K + row0 * K;
+        const __gm__ data_T* bBase = ws1 + i * K * L1 + col0;
+
+        // Init: both L0 ping-pong buffers free, both L1 A/B buffers free.
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
+
+        // Load chunk 0 into buffer 0 (A on event lanes 0/1, B on 2/3).
+        {
+            pto::GlobalTensor<data_T, ShapeA, StrideA> ag(const_cast<__gm__ data_T*>(aBase), ShapeA(validM));
+            pto::GlobalTensor<data_T, ShapeB, StrideB> bg(const_cast<__gm__ data_T*>(bBase), ShapeB(validN));
+            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+            TLOAD(a_l1[0], ag);
+            set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+            TLOAD(b_l1[0], bg);
+            set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
+        }
+
+        unsigned gphase = 0;
+        for (unsigned c = 0; c < nKd; c++) {
+            unsigned cur = c & 1;
+            event_t aLd = cur ? EVENT_ID1 : EVENT_ID0;
+            event_t bLd = cur ? EVENT_ID3 : EVENT_ID2;
+
+            // Prefetch chunk c+1 into the other L1 buffer (overlaps this chunk's compute).
+            if (c + 1 < nKd) {
+                unsigned nb = cur ^ 1;
+                event_t aLdN = nb ? EVENT_ID1 : EVENT_ID0;
+                event_t bLdN = nb ? EVENT_ID3 : EVENT_ID2;
+                unsigned k0 = (c + 1) * Kd;
+                pto::GlobalTensor<data_T, ShapeA, StrideA> ag(const_cast<__gm__ data_T*>(aBase + k0), ShapeA(validM));
+                pto::GlobalTensor<data_T, ShapeB, StrideB> bg(const_cast<__gm__ data_T*>(bBase + size_t(k0) * L1), ShapeB(validN));
+                wait_flag(PIPE_MTE1, PIPE_MTE2, aLdN);
+                TLOAD(a_l1[nb], ag);
+                set_flag(PIPE_MTE2, PIPE_MTE1, aLdN);
+                wait_flag(PIPE_MTE1, PIPE_MTE2, bLdN);
+                TLOAD(b_l1[nb], bg);
+                set_flag(PIPE_MTE2, PIPE_MTE1, bLdN);
+            }
+
+            // Wait for this chunk's GM->L1 load to complete.
+            wait_flag(PIPE_MTE2, PIPE_MTE1, aLd);
+            wait_flag(PIPE_MTE2, PIPE_MTE1, bLd);
+
+            for (unsigned p = 0; p < nP; p++) {
+                unsigned pp = gphase & 1;
+                event_t l0f = pp ? EVENT_ID1 : EVENT_ID0;
+
+                wait_flag(PIPE_M, PIPE_MTE1, l0f);              // L0[pp] free (matmul 2 phases ago)
+                TEXTRACT(a_l0[pp], a_l1[cur], 0, p * Kq);
+                TEXTRACT(b_l0[pp], b_l1[cur], p * Kq, 0);
+                if (p == nP - 1) {                              // last extract frees this L1 chunk
+                    set_flag(PIPE_MTE1, PIPE_MTE2, aLd);
+                    set_flag(PIPE_MTE1, PIPE_MTE2, bLd);
+                }
+                set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);         // RAW: matmul waits its extract
+                wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+                if (gphase == 0)
+                    TMATMUL(c_l0, a_l0[pp], b_l0[pp]);
+                else
+                    TMATMUL_ACC(c_l0, a_l0[pp], b_l0[pp]);
+                set_flag(PIPE_M, PIPE_MTE1, l0f);               // L0[pp] consumed, free to extract
+                gphase++;
+            }
+        }
+
+        // Drain: regardless of nKd/nP, both L1 A buffers (ID0/ID1), both L1 B
+        // buffers (ID2/ID3) and both L0 ping-pong buffers (ID0/ID1) end up signalled
+        // "free" and unconsumed; wait them so no flag state leaks into the next tile.
+        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+
+        // Store accumulator -> GM (F32 acc, NZ->ND), then free L0C for the next tile.
+        set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+        wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+        pto::GlobalTensor<float, ShapeC, StrideC> cg(
+            ws_res + i * L0 * L1 + row0 * L1 + col0, ShapeC(validM, validN));
+        TSTORE(cg, c_l0);
+        set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+        wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+}
+
 // Factored out so the standalone kernel and the fused kernel share it; the caller
 // guards with `if constexpr (DAV_CUBE)` and supplies the block index/count.
 // SPLITK enables the split-K schedule (see batched_matmul_inline body); it is off
@@ -587,12 +795,15 @@ AICORE inline void batched_matmul_inline(__gm__ const data_T* ws0, __gm__ const 
             // ksplit == 1: no idle cores to exploit, use the plain schedule below.
         }
 
-        // Plain schedule: block-distribute the output tiles, full K per tile.
+        // Plain schedule: block-distribute the output tiles (one contiguous chunk per
+        // core), full K per tile via the deep-pipelined tile. (An L2 tile-swizzle was
+        // tried here and removed — measured a no-op on square grids, HBM-bound, and a
+        // regression on non-square ones.)
         unsigned chunk = (total_tiles + block_num - 1) / block_num;
         unsigned start = block_idx * chunk;
         unsigned end = (start + chunk) < total_tiles ? (start + chunk) : total_tiles;
         for (unsigned t = start; t < end; t++) {
-            matmul_one_tile_inline<data_T, CONFIG_T, false>(ws0, ws1, ws_res, t, 0, nK);
+            matmul_one_tile_deep<data_T, CONFIG_T>(ws0, ws1, ws_res, t);
         }
 }
 
@@ -720,6 +931,21 @@ void transpose(const data_T* data, data_T* res, void* stream = nullptr) {
 // When the output permutation is identity (ij,jk->ik, bij,bjk->bik, … — the common
 // case) Phase C is a plain copy, so the Cube writes straight to res and the second
 // barrier + Phase C are dropped entirely (and ws_res is not even allocated).
+// Identity-input fast path — the input-side mirror of the identity-output skip above.
+// When an input's transpose is the identity AND the contraction needs no padding
+// (K==C), its workspace copy is byte-identical to the raw tensor, so Phase A's copy is
+// pure overhead (it dominates the fused kernel on plain matmuls); the matmul then reads
+// data0/data1 directly. A struct of static constexpr flags — not a constexpr function,
+// which would default to host-only and be uncallable from the __global__ kernel — so
+// host (setup/exec, workspace layout) and device (kernel, gating) always agree.
+template <typename CONFIG_T>
+struct EinsumSkip {
+    static constexpr unsigned C = CONFIG_T::n_contract;
+    static constexpr unsigned K = (C + 15) / 16 * 16;
+    static constexpr bool inp0 = IsIdentityPerm<typename CONFIG_T::tpose_inp0_config>::value && (K == C);
+    static constexpr bool inp1 = IsIdentityPerm<typename CONFIG_T::tpose_inp1_config>::value && (K == C);
+};
+
 template <typename data_T, typename CONFIG_T>
 __global__ AICORE void einsum_fused_kernel(
         __gm__ const data_T* data0, __gm__ const data_T* data1,
@@ -728,6 +954,10 @@ __global__ AICORE void einsum_fused_kernel(
     set_ffts_base_addr(ffts_addr);
 
     constexpr bool OUT_IDENTITY = IsIdentityPerm<typename CONFIG_T::tpose_out_conf>::value;
+    // Inputs whose copy into the workspace is redundant (identity perm + K==C) are
+    // read straight from data0/data1; their Phase A transpose is skipped below.
+    constexpr bool SKIP0 = EinsumSkip<CONFIG_T>::inp0;
+    constexpr bool SKIP1 = EinsumSkip<CONFIG_T>::inp1;
     // Split-K is enabled only when the output is identity (so the matmul target is
     // `res`, which the host pre-zeros for these configs — see builder._splitk so the
     // cores can atomic-add into it), there is K to split, and the output-tile grid
@@ -751,20 +981,24 @@ __global__ AICORE void einsum_fused_kernel(
         // input0's transpose output is [.., contract]; pad its innermost contract
         // dim C up to the fractal width K so the Cube reads a full K-wide A. The
         // pad is uniform across all I*L0 rows, so any batch count works directly.
-        transpose_inline<data_T, typename CONFIG_T::tpose_inp0_config, C, K>(data0, ws0, lane, nlanes);
+        // SKIP0: ws0 would be a byte-identical copy of data0 — read data0 directly.
+        if constexpr (!SKIP0)
+            transpose_inline<data_T, typename CONFIG_T::tpose_inp0_config, C, K>(data0, ws0, lane, nlanes);
 
         // input1's contract dim is the per-batch row count. For K==C, or a single
         // batch, the K-C tail sits after the (one) valid block, so a plain
         // transpose into the pre-zeroed ws1 suffices. For K!=C with batching, each
         // batch's C valid rows must land at the front of its K-row slot (stride
         // K*L1) — a contiguous write would mis-stride the batches — so repack with
-        // a per-batch K-row pad.
-        if constexpr (K != C && I > 1) {
-            static_assert(IsIdentityPerm<typename CONFIG_T::tpose_inp1_config>::value,
-                          "Batched K!=C fusion assumes an identity input1 permutation.");
-            batched_pad_copy_inline<data_T>(data1, ws1, I, C, L1, K * L1, lane, nlanes);
-        } else {
-            transpose_inline<data_T, typename CONFIG_T::tpose_inp1_config>(data1, ws1, lane, nlanes);
+        // a per-batch K-row pad. SKIP1: ws1 == data1, read data1 directly.
+        if constexpr (!SKIP1) {
+            if constexpr (K != C && I > 1) {
+                static_assert(IsIdentityPerm<typename CONFIG_T::tpose_inp1_config>::value,
+                              "Batched K!=C fusion assumes an identity input1 permutation.");
+                batched_pad_copy_inline<data_T>(data1, ws1, I, C, L1, K * L1, lane, nlanes);
+            } else {
+                transpose_inline<data_T, typename CONFIG_T::tpose_inp1_config>(data1, ws1, lane, nlanes);
+            }
         }
     }
 
@@ -774,9 +1008,12 @@ __global__ AICORE void einsum_fused_kernel(
         // Identity output: the matmul's natural layout already is res, so write it
         // directly and skip the whole output-transpose pass below. SPLITK_ELIGIBLE
         // configs (identity, thin grid) hand idle cores K-slices that atomic-add
-        // into the pre-zeroed res.
+        // into the pre-zeroed res. The matmul reads each input from the workspace, or
+        // straight from the raw tensor when its copy was skipped (SKIP0/SKIP1).
         __gm__ float* mm_out = OUT_IDENTITY ? res : ws_res;
-        batched_matmul_inline<data_T, CONFIG_T, SPLITK_ELIGIBLE>(ws0, ws1, mm_out, get_block_idx(), get_block_num());
+        __gm__ const data_T* mmA = SKIP0 ? data0 : static_cast<__gm__ const data_T*>(ws0);
+        __gm__ const data_T* mmB = SKIP1 ? data1 : static_cast<__gm__ const data_T*>(ws1);
+        batched_matmul_inline<data_T, CONFIG_T, SPLITK_ELIGIBLE>(mmA, mmB, mm_out, get_block_idx(), get_block_num());
     }
 
     if constexpr (!OUT_IDENTITY) {
@@ -818,16 +1055,27 @@ template <typename data_T, typename CONFIG_T>
 void* einsum_setup(void* stream = nullptr) {
     constexpr unsigned C = CONFIG_T::n_contract;
     constexpr unsigned K = (C + 15) / 16 * 16;
-    const size_t ws0_elems = einsum_ws0_elems<data_T, CONFIG_T>();
-    const size_t ws1_elems = einsum_ws1_elems<data_T, CONFIG_T>();
+    // Skipped inputs (identity perm + K==C) are read straight from data0/data1, so
+    // their workspace region is neither allocated nor copied into. Note K!=C forces
+    // both SKIP flags false, so the pad-zeroing path below always has its buffers.
+    constexpr bool SKIP0 = EinsumSkip<CONFIG_T>::inp0;
+    constexpr bool SKIP1 = EinsumSkip<CONFIG_T>::inp1;
+    const size_t ws0_elems = SKIP0 ? 0 : einsum_ws0_elems<data_T, CONFIG_T>();
+    const size_t ws1_elems = SKIP1 ? 0 : einsum_ws1_elems<data_T, CONFIG_T>();
     const size_t ws0_bytes = sizeof(data_T) * ws0_elems;
     const size_t ws1_bytes = sizeof(data_T) * ws1_elems;
     // Identity output writes straight to res, so ws_res is never read — don't alloc it.
     constexpr bool OUT_IDENTITY = IsIdentityPerm<typename CONFIG_T::tpose_out_conf>::value;
     const size_t wsr_bytes = OUT_IDENTITY ? 0 : sizeof(float) * CONFIG_T::tpose_out_conf::N;
 
+    // A pure plain matmul (both inputs skipped, identity output) needs no workspace at
+    // all; allocate a token byte so the runner caches a non-null handle and does not
+    // re-run setup every call.
+    size_t total = ws0_bytes + ws1_bytes + wsr_bytes;
+    if (total == 0) total = sizeof(data_T);
+
     void* workspace = nullptr;
-    aclrtMalloc(&workspace, ws0_bytes + ws1_bytes + wsr_bytes, ACL_MEM_MALLOC_NORMAL_ONLY);
+    aclrtMalloc(&workspace, total, ACL_MEM_MALLOC_NORMAL_ONLY);
 
     if constexpr (K != C) {
         data_T* ws0 = reinterpret_cast<data_T*>(workspace);
@@ -850,8 +1098,11 @@ void einsum_exec(const data_T* data0, const data_T* data1, float* res,
     int64_t core_num = 1;
     aclrtGetDeviceInfo(device_id, ACL_DEV_ATTR_AICORE_CORE_NUM, &core_num);
 
-    const size_t ws0_elems = einsum_ws0_elems<data_T, CONFIG_T>();
-    const size_t ws1_elems = einsum_ws1_elems<data_T, CONFIG_T>();
+    // Match einsum_setup's layout: skipped inputs occupy no workspace region.
+    constexpr bool SKIP0 = EinsumSkip<CONFIG_T>::inp0;
+    constexpr bool SKIP1 = EinsumSkip<CONFIG_T>::inp1;
+    const size_t ws0_elems = SKIP0 ? 0 : einsum_ws0_elems<data_T, CONFIG_T>();
+    const size_t ws1_elems = SKIP1 ? 0 : einsum_ws1_elems<data_T, CONFIG_T>();
 
     data_T* ws0 = reinterpret_cast<data_T*>(workspace);
     data_T* ws1 = reinterpret_cast<data_T*>(ws0 + ws0_elems);

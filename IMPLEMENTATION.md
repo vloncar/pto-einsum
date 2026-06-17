@@ -174,6 +174,10 @@ For each output tile (`matmul_one_tile_inline`):
    even for fp16 inputs.
 2. The result tile is stored to GM. Output is always FP32.
 
+`matmul_one_tile_inline` is the baseline tile shown here (and the split-K tile of
+§2.6); the plain schedule actually runs each tile through the deeper-pipelined
+`matmul_one_tile_deep` (§2.7), which computes the same thing.
+
 **GM windows carry real dims.** The ND→NZ loader takes its row/column transfer
 counts (`nValue`/`dValue`) directly from the GM `Shape`, *not* from the tile's
 valid extents. So the GM `Shape` for each tile must describe the real data
@@ -256,7 +260,8 @@ This removes a whole Vec copy pass, one cross-core barrier, and the output-buffe
 allocation for the typical matmul. It is correct because the matmul writes every
 real `M×N` output element (partial tiles still cover the full real output), so the
 `res` buffer is fully written. Only non-identity outputs (e.g. some `ai,ja->ij`
-layouts) still run Phase C.
+layouts) still run Phase C. Its input-side mirror — skipping the redundant *input*
+copies — is §2.8.
 
 ## 2.4 L1 Mat-tile double buffering
 
@@ -268,9 +273,11 @@ default tile, so two won't fit; the mov→matmul chain stays serialized but the
 expensive GM loads are hidden behind compute. A `static_assert` checks the
 double-buffered L1 tiles fit the 512 KB CBUF.
 
-(A symmetric L0 double-buffering of `Left`/`Right` was tried and reverted — it was
-~12% slower for fp32-128 and only ~5% faster for fp16 while needing an extra
-`PIPE_ALL`; not worth it.)
+(A *shallow* L0 double-buffering — shrinking `Kt` so two `Left`/`Right` tiles fit —
+was tried and reverted: ~12% slower for fp32-128, only ~5% faster for fp16, and it
+needed an extra `PIPE_ALL`. A *deeper* L0 ping-pong that keeps `Kt` and extracts L0
+sub-tiles from a larger L1 chunk does pay off and is the plain schedule's per-tile
+path — see §2.7. `matmul_one_tile_inline` itself now serves only the split-K path.)
 
 ## 2.5 Adaptive `tile_k` (thin-problem K depth)
 
@@ -314,6 +321,51 @@ plain schedule.
 
 Net: the dot product drops ~1.9 ms → ~0.19 ms (~10×, from 4× slower than torch to
 ~2.4× faster). All other benchmark cases are unaffected (gated off).
+
+## 2.7 Deep-pipelined Cube tile (`matmul_one_tile_deep`)
+
+§2.4's per-`Kt` loop single-buffers L0, so the Cube stalls on the L1→L0 mov. The
+plain (non-split-K) schedule instead runs each tile through `matmul_one_tile_deep`,
+which adds two overlaps:
+
+- **L1 chunk reuse**: A `[Mt, Kd]` and B `[Kd, Nt]` are loaded once per `Kd`-deep
+  chunk and `TEXTRACT`-ed into `Kd/Kq` L0 sub-tiles, amortizing the big GM→L1
+  transfers. `Kq` (L0 compute granularity) and `Kd` (L1 chunk depth) are constexpr
+  from `Mt/Nt/K/dtype` (`deep_pick_kq`/`deep_pick_kd`) and both divide `K`, so the
+  chunk and phase loops are clean — awkward or small `K` collapses to `Kd = Kq = K`.
+- **L0 ping-pong**: the `Left`/`Right` tiles double-buffer so the `TEXTRACT` of phase
+  `p+1` (MTE1) overlaps the `TMATMUL` of phase `p` (M); the L1 chunks also
+  double-buffer to prefetch the next chunk's GM→L1 load under the current compute.
+
+Each tile is self-contained (inits its event flags, drains them before the store).
+This brings the matmul itself to ~parity with `torch` (fp32 2048² 403→313 µs; fp16
+155 vs 140 µs), and is correct across fp16/fp32, batched, `K!=C`, and partial tiles.
+
+(An L2 tile-swizzle was also ported here from the pto-kernels matmul-swizzle example
+and then **removed**. Measured cleanly it was a no-op on square grids — they are
+HBM-bound on redundant operand streaming, which a schedule reorder cannot fix — and a
+regression on non-square grids. The schedule is a plain contiguous-chunk distribution.)
+
+## 2.8 Identity-input fast path (skip Phase A)
+
+The input-side mirror of §2.3. When an input's transpose permutation is the identity
+**and** the contraction needs no fractal padding (`K==C`), its canonical workspace
+layout is byte-identical to the raw tensor, so copying it into `ws0`/`ws1` is pure
+overhead — and on plain matmuls that copy *dominates* the fused kernel (the GM→UB→GM
+copy of both operands cost ~14× the matmul on a 2048² case; it was the real gap, not
+the matmul). `EinsumSkip<CONFIG_T>` (static `constexpr inp0`/`inp1`) gates it:
+
+- the kernel **skips that input's Phase A transpose** (`if constexpr (!SKIP0) …`) and
+  the matmul reads `data0`/`data1` **directly** (`mmA = SKIP0 ? data0 : ws0`);
+- `einsum_setup`/`einsum_exec` drop the skipped buffer from the workspace layout (a
+  token byte is allocated if nothing remains — e.g. the dot product — so the runner
+  still caches a non-null handle instead of re-running setup every call).
+
+It must be a struct with `static constexpr` members, not a `constexpr` function — a
+plain `constexpr` function defaults to host-only and the `__global__` kernel cannot
+call it. `K!=C` forces both flags false (those inputs genuinely need §2.2's pad
+repack). Net: the full einsum collapses onto the matmul — 2048² fp16 2339→178 µs
+(13×), fp32 3913→338 µs (~parity with torch).
 
 ---
 

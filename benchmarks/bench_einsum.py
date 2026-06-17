@@ -30,6 +30,16 @@ def run_benchmark():
             "shape1": (512, 512),
             "dtype": torch.float16,
         },
+        # Large square matmul: a 16x16 (fp16) output-tile grid, big enough that the
+        # L2 swizzle and the deep-pipelined Cube tile actually engage (the other
+        # matmul cases are <=16 tiles on 20 cores, too small to exercise either).
+        {
+            "name": "Large MatMul (fp16)",
+            "equation": "ij, jk -> ik",
+            "shape0": (2048, 2048),
+            "shape1": (2048, 2048),
+            "dtype": torch.float16,
+        },
         # Transpose-heavy: input0 "ji" needs a real (non-identity) 2D transpose of
         # a large operand, driving the blocked multi-core TTRANS path.
         {
