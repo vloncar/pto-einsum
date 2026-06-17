@@ -147,11 +147,17 @@ Verify across tile sizes, e.g. `EINSUM_TILE_SIZE=32 pytest tests/test_einsum.py`
 
 ```bash
 export PTO_LIB_PATH=/path/to/pto-isa
-python benchmarks/bench_einsum.py        # writes bench_results.png
+python benchmarks/bench_einsum.py             # all benchmarks
+python benchmarks/bench_einsum.py matmul      # a single benchmark
 ```
 
-Compares the custom kernels against `torch.einsum` on the NPU across a set of
-einsum patterns.
+Compares the custom kernels against `torch.einsum` on the NPU. Each benchmark is
+an einsum pattern swept over a range of tensor sizes (for scaling behaviour).
+With no argument all benchmarks run; pass a benchmark name to run just one
+(`matmul`, `matmul-fp16`, `transpose`, `outer`, `dot-product`, `batch-matmul`,
+`contraction`, `custom-layout`, `unaligned`, `batch-unaligned`). Plots are
+written to `benchmarks/bench_results/`: one image per benchmark plus a
+`summary.png` showing each pattern's mean speedup with its min/max range.
 
 > **Note:** the JIT build cache keys only on the generated `.cpp` (config), not on
 > the bundled headers. If you edit `src/pto_einsum/include/*.h`, delete the build
