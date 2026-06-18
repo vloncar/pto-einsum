@@ -78,6 +78,16 @@ from pto_einsum import einsum, EinsumBuilder
     ("ij, jk -> ik", (250, 128), (128, 256)),   # partial M
     ("ij, jk -> ik", (256, 128), (128, 250)),   # partial N
     ("ij, jk -> ik", (250, 128), (128, 250)),   # both
+    # Partial *tile grid*: the padded free dim is itself NOT a multiple of the 128 tile,
+    # so a boundary tile would leave fully-empty trailing fractal blocks. The operand is
+    # padded up to a whole tile (Ma rows for A, Na cols for B), zero-filled, so the
+    # matmul loads full tiles; the store clamps to the real dim. Output dims are now
+    # arbitrary. 200 -> pad 208 -> tile-pad 256; 1000 -> Mpad 1008 -> tile-pad 1024.
+    ("ij, jk -> ik", (200, 64), (64, 128)),    # partial M grid
+    ("ij, jk -> ik", (128, 64), (64, 200)),    # partial N grid
+    ("ij, jk -> ik", (200, 64), (64, 200)),    # both
+    ("ij, jk -> ik", (1000, 64), (64, 128)),   # large partial M grid
+    ("ij, jk -> ik", (200, 20), (20, 200)),    # partial M+N with K!=C (j=20 -> K=32)
 ])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_einsum_correctness(equation, shape0, shape1, dtype):
@@ -106,16 +116,21 @@ def test_einsum_correctness(equation, shape0, shape1, dtype):
     torch.testing.assert_close(result, expected, rtol=rtol, atol=atol)
 
 
+@pytest.mark.parametrize("T, S, N, P", [
+    (96, 96, 64, 128),     # all free dims single-tile / aligned (baseline)
+    (320, 320, 64, 128),   # T=S=320 -> partial M/N grid (operand-padded to 384)
+])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-def test_linear_attention_chain(dtype):
+def test_linear_attention_chain(dtype, T, S, N, P):
     # Linear attention `einsum("tn,sn,sp,ts->tp", Q,K,V,L)` expressed as the three
     # two-way contractions it decomposes into. The middle step is the L-mask
     # Hadamard `ts,ts->ts`, which exercises the elementwise kernel; the outer two
     # are ordinary matmuls. Validates the whole chain against torch's 4-way einsum.
+    # The 320 case drives the two matmuls with a non-128-multiple seq length (a
+    # partial output-tile grid), end-to-end alongside the Hadamard L-mask.
     if TEST_DEVICE == "cpu" and dtype == torch.float16:
         pytest.skip("float16 is not supported on CPU")
 
-    T, S, N, P = 96, 96, 64, 128   # TS = 9216 >= the elementwise kernel threshold
     Q = torch.rand(T, N, dtype=dtype, device=TEST_DEVICE)
     K = torch.rand(S, N, dtype=dtype, device=TEST_DEVICE)
     V = torch.rand(S, P, dtype=dtype, device=TEST_DEVICE)

@@ -237,11 +237,16 @@ and the zero padding contributes nothing to the sum. *How* the padded buffers ar
 produced without a host round-trip is an optimization — see §2.2.
 
 **Tiling.** The per-batch output is partitioned into an `Mt × Nt` tile grid (tile
-sizes are `min(config, padded-dim)`, multiples of 16). It requires
-`M%Mt == N%Nt == K%Kt == 0` (full grid, no partial tiles), enforced by a
-`static_assert`. All `(batch, m-tile, n-tile)` units are flattened into a 1D index
-space (`total_tiles = I·(M/Mt)·(N/Nt)`) and block-distributed across the AI cores.
-For each output tile (`matmul_one_tile_inline`):
+sizes are `min(config, padded-dim)`, multiples of 16). The grid tiles over the
+*operand-padded* extents `Ma = ⌈M/Mt⌉·Mt` and `Na = ⌈N/Nt⌉·Nt` (and `K`, which
+`tile_k` always divides), so every tile is full — `Ma%Mt == Na%Nt == K%Kt == 0`.
+A free dim that is not a whole tile multiple (e.g. `L0 = 200 → M = 208 → Ma = 256`)
+is handled by padding the *operand buffer* up to `Ma` rows / `Na` cols, zero-filled
+(see the "GM windows carry real dims" load/store note below); the output store still
+clamps to the real `L0/L1`, so output dims are arbitrary. All `(batch, m-tile, n-tile)` units
+are flattened into a 1D index space (`total_tiles = I·(Ma/Mt)·(Na/Nt)`) and
+block-distributed across the AI cores. For each output tile
+(`matmul_one_tile_inline`):
 
 1. The accumulator (an FP32 `Acc` tile in L0C) is built by walking the
    contraction in `Kt`-wide steps: the first step uses `TMATMUL` (initialise),
@@ -255,12 +260,21 @@ For each output tile (`matmul_one_tile_inline`):
 
 **GM windows carry real dims.** The ND→NZ loader takes its row/column transfer
 counts (`nValue`/`dValue`) directly from the GM `Shape`, *not* from the tile's
-valid extents. So the GM `Shape` for each tile must describe the real data
-window — `validM × Kt` for `A`, `Kt × validN` for `B`, `validM × validN` for the
-store — using `DYNAMIC` shape dims set at construction. Using the padded `Mt`/`Nt`
-here would over-read past the physical `L0`/`L1` extent and corrupt boundary
-tiles (this is exactly what breaks a degenerate `validN = 1` dot product if
-missed).
+valid extents (set via `DYNAMIC` shape dims at construction). Two regimes:
+
+- **Store** always uses the *real* window `validM × validN` (`validM = min(L0−row0,
+  Mt)`), with stride `L1` over the unpadded output. Using the padded `Mt`/`Nt` here
+  would over-write past the physical output (it is exactly what breaks a degenerate
+  `validN = 1` dot product if missed).
+- **Load** uses `validM`/`validN` for an *aligned* operand (`A_PADDED`/`B_PADDED`
+  false — the buffer is exactly `L0`/`L1` and the last tile's valid extent is always
+  `> Mt−16`, so every fractal block is touched). For a *partial* operand the buffer
+  is padded to `Ma` rows / `Na` cols (zero tail) and the load reads a **full** tile
+  (`loadM = Mt`, `loadN = Nt`). This is required, not just defensive: the row/col
+  analogue of the partial-C0 quirk corrupts a tile whenever a *trailing 16-row
+  fractal block is fully empty* (valid extent `≤ Mt−16`), so the operand load must
+  fill every block. The store still clamps to `validM × validN`, so the zero pad
+  rows/cols produce discarded zero output.
 
 ### CPU reference (`cpu_einsum.h`)
 
@@ -482,9 +496,15 @@ stale `.so` is reused and the change appears to have no effect.
 - Lift the N-D batched-`TTRANS` `srcColStride==1` requirement (source whose
   second-innermost output axis is non-contiguous) — needs a non-contiguous gather,
   not a single strided DMA; shares its mechanism with the broadcast-op item below.
-- Support partial tiles (problem dims not divisible by the tile size), removing
-  the matmul divisibility constraint.
-- Support unaligned large 2D transposes, removing the blocked-transpose 16-aligned
-  constraint.
+- **Done:** partial matmul tiles (output dim not a multiple of the tile) — the
+  operand buffer is padded up to a whole tile (`Ma` rows / `Na` cols, zero-filled)
+  so every tile loads full; the store clamps to the real dim. Output dims are now
+  arbitrary. Currently single-batch (`I==1`) only — a batched partial config needs
+  the per-batch row/col block padded, rejected with a `ValueError` for now.
+- Support unaligned *large* 2D transposes, removing the blocked-transpose
+  16-aligned constraint. This is the remaining blocker for *arbitrary* (large,
+  non-16-aligned) linear-attention sequence lengths — the matmul handles them, but
+  the QKᵀ input transpose for e.g. `seqlen=1000` hits this. 16-aligned (or small)
+  lengths already work.
 - Pure broadcast / scaling ops (`bsd,d->bsd`, `rms_norm`, `rope`) — empty
   contraction, a Vector-only broadcast-multiply path, not a matmul.

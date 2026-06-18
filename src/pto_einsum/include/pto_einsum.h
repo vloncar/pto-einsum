@@ -675,9 +675,25 @@ struct MatmulGeom {
     static constexpr unsigned Mt = CONFIG_T::tile_m < M ? CONFIG_T::tile_m : M;
     static constexpr unsigned Nt = CONFIG_T::tile_n < N ? CONFIG_T::tile_n : N;
     static constexpr unsigned Kt = CONFIG_T::tile_k < K ? CONFIG_T::tile_k : K;
-    static constexpr unsigned nN = N / Nt;
+    // Operand row/col padding for partial tiles. A boundary tile whose padded dim is
+    // not a whole multiple of the clamped tile would leave fully-empty trailing 16-row
+    // fractal blocks in the Mat operand, which the ND->NZ load misplaces (corrupting
+    // the tile). So pad A's rows up to Ma and B's cols up to Na (whole-tile multiples),
+    // zero-filled, so every loaded tile is full; the output store still clamps to the
+    // real L0/L1. The padded per-batch block has a single-batch layout only, so a
+    // genuinely partial dim (A_PADDED/B_PADDED) requires I==1 (asserted in the kernel).
+    static constexpr unsigned Ma = (M + Mt - 1) / Mt * Mt;   // A rows -> whole tiles
+    static constexpr unsigned Na = (N + Nt - 1) / Nt * Nt;   // B cols -> whole tiles
+    static constexpr bool A_PADDED = (Ma > M);
+    static constexpr bool B_PADDED = (Na > N);
+    // Per-batch buffer extents the matmul addresses: the padded count when partial
+    // (read a full tile from the zero-filled tail), else the real L0/L1 (the existing
+    // path -- a full grid whose last tile carries a >Mt-16 partial valid extent).
+    static constexpr unsigned Arows = A_PADDED ? Ma : L0;
+    static constexpr unsigned Bcols = B_PADDED ? Na : L1;
+    static constexpr unsigned nN = Na / Nt;
     static constexpr unsigned nK = K / Kt;
-    static constexpr unsigned tiles_per_batch = (M / Mt) * nN;
+    static constexpr unsigned tiles_per_batch = (Ma / Mt) * nN;
     static constexpr unsigned total_tiles = I * tiles_per_batch;
 };
 
@@ -700,11 +716,18 @@ AICORE inline void matmul_one_tile_inline(__gm__ const data_T* ws0, __gm__ const
         constexpr unsigned Kt = G::Kt;
         constexpr unsigned nN = G::nN;
         constexpr unsigned tiles_per_batch = G::tiles_per_batch;
+        // Padded-operand geometry (see MatmulGeom). When a dim is partial the buffer
+        // carries Ma/Na rows/cols (zero-filled tail) and the matmul loads a *full* tile
+        // so no fractal block is empty; the output store still clamps to real L0/L1.
+        static_assert(G::I == 1 || (!G::A_PADDED && !G::B_PADDED),
+                      "partial M/N tiles (free dim not a multiple of the tile) require I==1");
+        constexpr unsigned Arows = G::Arows;
+        constexpr unsigned Bcols = G::Bcols;
 
         using ShapeA = pto::Shape<1, 1, 1, -1, Kt>;
         using StrideA = pto::Stride<1, 1, 1, K, 1>;
         using ShapeB = pto::Shape<1, 1, 1, Kt, -1>;
-        using StrideB = pto::Stride<1, 1, 1, L1, 1>;
+        using StrideB = pto::Stride<1, 1, 1, Bcols, 1>;
         using ShapeC = pto::Shape<1, 1, 1, -1, -1>;
         using StrideC = pto::Stride<1, 1, 1, L1, 1>;
         using MatTileA = pto::Tile<pto::TileType::Mat, data_T, Mt, Kt, pto::BLayout::ColMajor, -1, -1, pto::SLayout::RowMajor, 512>;
@@ -718,10 +741,14 @@ AICORE inline void matmul_one_tile_inline(__gm__ const data_T* ws0, __gm__ const
         unsigned row0 = (rem / nN) * Mt;  // output row offset within the matrix
         unsigned col0 = (rem % nN) * Nt;  // output col offset within the matrix
 
-        // Boundary tiles see fewer real rows/cols than the padded tile (GM is
-        // L0xK / KxL1). row0 < L0 and col0 < L1 always hold for a full grid.
+        // Boundary tiles store fewer real rows/cols than the padded tile (output GM is
+        // L0xL1). row0 < L0 and col0 < L1 always hold. The *load* reads a full tile when
+        // the operand is padded (Arows/Bcols-tall zero-filled buffer), else the real
+        // valid extent (the aligned path, whose last tile is a >Mt-16 partial extent).
         unsigned validM = (L0 - row0) < Mt ? (L0 - row0) : Mt;
         unsigned validN = (L1 - col0) < Nt ? (L1 - col0) : Nt;
+        unsigned loadM = G::A_PADDED ? Mt : validM;
+        unsigned loadN = G::B_PADDED ? Nt : validN;
 
         // Double buffering. The L1 Mat tiles are ping-ponged across two buffers
         // so the GM->L1 load (MTE2, the slow stage) of the next K step overlaps
@@ -748,13 +775,15 @@ AICORE inline void matmul_one_tile_inline(__gm__ const data_T* ws0, __gm__ const
         TASSIGN(rightB, 0);
         TASSIGN(accC, 0);
 
-        // Valid extents are constant across the K-loop, so set them once.
-        matA[0].SetValidRow(validM); matA[0].SetValidCol(Kt);
-        matA[1].SetValidRow(validM); matA[1].SetValidCol(Kt);
-        matB[0].SetValidRow(Kt);     matB[0].SetValidCol(validN);
-        matB[1].SetValidRow(Kt);     matB[1].SetValidCol(validN);
-        leftA.SetValidRow(validM);   leftA.SetValidCol(Kt);
-        rightB.SetValidRow(Kt);      rightB.SetValidCol(validN);
+        // Valid extents are constant across the K-loop, so set them once. The Mat/Left/
+        // Right operands load the full tile (loadM/loadN) so the ND->NZ packing has no
+        // empty fractal block; only the accumulator/store carry the real validM/validN.
+        matA[0].SetValidRow(loadM); matA[0].SetValidCol(Kt);
+        matA[1].SetValidRow(loadM); matA[1].SetValidCol(Kt);
+        matB[0].SetValidRow(Kt);     matB[0].SetValidCol(loadN);
+        matB[1].SetValidRow(Kt);     matB[1].SetValidCol(loadN);
+        leftA.SetValidRow(loadM);   leftA.SetValidCol(Kt);
+        rightB.SetValidRow(Kt);      rightB.SetValidCol(loadN);
         accC.SetValidRow(validM);    accC.SetValidCol(validN);
 
         // Event IDs (per L1 buffer where two can be in flight):
@@ -770,9 +799,9 @@ AICORE inline void matmul_one_tile_inline(__gm__ const data_T* ws0, __gm__ const
             event_t e_ldf = p ? EVENT_ID3 : EVENT_ID2;
             unsigned k0 = (kStart + j) * Kt;
             pto::GlobalTensor<data_T, ShapeA, StrideA> aGlobal(
-                const_cast<__gm__ data_T*>(ws0 + i * L0 * K + row0 * K + k0), ShapeA(validM));
+                const_cast<__gm__ data_T*>(ws0 + i * Arows * K + row0 * K + k0), ShapeA(loadM));
             pto::GlobalTensor<data_T, ShapeB, StrideB> bGlobal(
-                const_cast<__gm__ data_T*>(ws1 + i * K * L1 + k0 * L1 + col0), ShapeB(validN));
+                const_cast<__gm__ data_T*>(ws1 + i * K * Bcols + k0 * Bcols + col0), ShapeB(loadN));
 
             // Load GM -> L1 buffer p (wait until a prior mov freed this buffer).
 
@@ -885,6 +914,12 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
         constexpr unsigned Nt = G::Nt;
         constexpr unsigned nN = G::nN;
         constexpr unsigned tiles_per_batch = G::tiles_per_batch;
+        // Padded-operand geometry (see MatmulGeom): a partial dim loads a full tile from
+        // an Ma/Na-padded zero-filled buffer; the store still clamps to real L0/L1.
+        static_assert(G::I == 1 || (!G::A_PADDED && !G::B_PADDED),
+                      "partial M/N tiles (free dim not a multiple of the tile) require I==1");
+        constexpr unsigned Arows = G::Arows;
+        constexpr unsigned Bcols = G::Bcols;
 
         constexpr unsigned ds  = sizeof(data_T);
         constexpr unsigned Kq  = deep_pick_kq(Mt, Nt, K, ds);
@@ -895,7 +930,7 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
         using ShapeA = pto::Shape<1, 1, 1, -1, Kd>;
         using StrideA = pto::Stride<1, 1, 1, K, 1>;
         using ShapeB = pto::Shape<1, 1, 1, Kd, -1>;
-        using StrideB = pto::Stride<1, 1, 1, L1, 1>;
+        using StrideB = pto::Stride<1, 1, 1, Bcols, 1>;
         using ShapeC = pto::Shape<1, 1, 1, -1, -1>;
         using StrideC = pto::Stride<1, 1, 1, L1, 1>;
         using MatTileA = pto::Tile<pto::TileType::Mat, data_T, Mt, Kd, pto::BLayout::ColMajor, -1, -1, pto::SLayout::RowMajor, 512>;
@@ -910,6 +945,8 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
         unsigned col0 = (rem % nN) * Nt;
         unsigned validM = (L0 - row0) < Mt ? (L0 - row0) : Mt;
         unsigned validN = (L1 - col0) < Nt ? (L1 - col0) : Nt;
+        unsigned loadM = G::A_PADDED ? Mt : validM;   // full-tile load when padded
+        unsigned loadN = G::B_PADDED ? Nt : validN;
 
         constexpr unsigned matBytesA = Mt * Kd * ds;
         constexpr unsigned matBytesB = Kd * Nt * ds;
@@ -935,18 +972,20 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
         TASSIGN(b_l0[1], l0bBytes);
         TASSIGN(c_l0, 0);
 
-        a_l1[0].SetValidRow(validM); a_l1[0].SetValidCol(Kd);
-        a_l1[1].SetValidRow(validM); a_l1[1].SetValidCol(Kd);
-        b_l1[0].SetValidRow(Kd);     b_l1[0].SetValidCol(validN);
-        b_l1[1].SetValidRow(Kd);     b_l1[1].SetValidCol(validN);
-        a_l0[0].SetValidRow(validM); a_l0[0].SetValidCol(Kq);
-        a_l0[1].SetValidRow(validM); a_l0[1].SetValidCol(Kq);
-        b_l0[0].SetValidRow(Kq);     b_l0[0].SetValidCol(validN);
-        b_l0[1].SetValidRow(Kq);     b_l0[1].SetValidCol(validN);
+        // Operands load the full tile (loadM/loadN) so the ND->NZ packing has no empty
+        // fractal block; only the accumulator/store carry the real validM/validN.
+        a_l1[0].SetValidRow(loadM); a_l1[0].SetValidCol(Kd);
+        a_l1[1].SetValidRow(loadM); a_l1[1].SetValidCol(Kd);
+        b_l1[0].SetValidRow(Kd);     b_l1[0].SetValidCol(loadN);
+        b_l1[1].SetValidRow(Kd);     b_l1[1].SetValidCol(loadN);
+        a_l0[0].SetValidRow(loadM); a_l0[0].SetValidCol(Kq);
+        a_l0[1].SetValidRow(loadM); a_l0[1].SetValidCol(Kq);
+        b_l0[0].SetValidRow(Kq);     b_l0[0].SetValidCol(loadN);
+        b_l0[1].SetValidRow(Kq);     b_l0[1].SetValidCol(loadN);
         c_l0.SetValidRow(validM);    c_l0.SetValidCol(validN);
 
-        const __gm__ data_T* aBase = ws0 + i * L0 * K + row0 * K;
-        const __gm__ data_T* bBase = ws1 + i * K * L1 + col0;
+        const __gm__ data_T* aBase = ws0 + i * Arows * K + row0 * K;
+        const __gm__ data_T* bBase = ws1 + i * K * Bcols + col0;
 
         // Init: both L0 ping-pong buffers free, both L1 A/B buffers free.
         set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
@@ -958,8 +997,8 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
 
         // Load chunk 0 into buffer 0 (A on event lanes 0/1, B on 2/3).
         {
-            pto::GlobalTensor<data_T, ShapeA, StrideA> ag(const_cast<__gm__ data_T*>(aBase), ShapeA(validM));
-            pto::GlobalTensor<data_T, ShapeB, StrideB> bg(const_cast<__gm__ data_T*>(bBase), ShapeB(validN));
+            pto::GlobalTensor<data_T, ShapeA, StrideA> ag(const_cast<__gm__ data_T*>(aBase), ShapeA(loadM));
+            pto::GlobalTensor<data_T, ShapeB, StrideB> bg(const_cast<__gm__ data_T*>(bBase), ShapeB(loadN));
             wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
             TLOAD(a_l1[0], ag);
             set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
@@ -980,8 +1019,8 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
                 event_t aLdN = nb ? EVENT_ID1 : EVENT_ID0;
                 event_t bLdN = nb ? EVENT_ID3 : EVENT_ID2;
                 unsigned k0 = (c + 1) * Kd;
-                pto::GlobalTensor<data_T, ShapeA, StrideA> ag(const_cast<__gm__ data_T*>(aBase + k0), ShapeA(validM));
-                pto::GlobalTensor<data_T, ShapeB, StrideB> bg(const_cast<__gm__ data_T*>(bBase + size_t(k0) * L1), ShapeB(validN));
+                pto::GlobalTensor<data_T, ShapeA, StrideA> ag(const_cast<__gm__ data_T*>(aBase + k0), ShapeA(loadM));
+                pto::GlobalTensor<data_T, ShapeB, StrideB> bg(const_cast<__gm__ data_T*>(bBase + size_t(k0) * Bcols), ShapeB(loadN));
                 wait_flag(PIPE_MTE1, PIPE_MTE2, aLdN);
                 TLOAD(a_l1[nb], ag);
                 set_flag(PIPE_MTE2, PIPE_MTE1, aLdN);
@@ -1045,9 +1084,14 @@ AICORE inline void batched_matmul_inline(__gm__ const data_T* ws0, __gm__ const 
                                          __gm__ float* ws_res, unsigned block_idx, unsigned block_num) {
         using G = MatmulGeom<CONFIG_T>;
 
-        // Full tile grid only (no partial tiles).
-        static_assert(G::M % G::Mt == 0 && G::N % G::Nt == 0 && G::K % G::Kt == 0,
-                      "Tiling requires padded M/N/K divisible by the (clamped) tile size.");
+        // The grid tiles over the operand-padded extents Ma/Na (whole-tile multiples by
+        // construction) and K (tile_k divides padded K), so every tile is full; a
+        // partial free dim is absorbed by the zero-padded operand buffers. Partial dims
+        // currently have a single-batch layout only.
+        static_assert(G::Ma % G::Mt == 0 && G::Na % G::Nt == 0 && G::K % G::Kt == 0,
+                      "Padded grid Ma/Na/K must divide the (clamped) tile size.");
+        static_assert(G::I == 1 || (!G::A_PADDED && !G::B_PADDED),
+                      "partial M/N tiles (free dim not a multiple of the tile) require I==1");
 
         constexpr unsigned nK = G::nK;
         constexpr unsigned total_tiles = G::total_tiles;
@@ -1389,8 +1433,13 @@ template <typename CONFIG_T>
 struct EinsumSkip {
     static constexpr unsigned C = CONFIG_T::n_contract;
     static constexpr unsigned K = (C + 15) / 16 * 16;
-    static constexpr bool inp0 = IsIdentityPerm<typename CONFIG_T::tpose_inp0_config>::value && (K == C);
-    static constexpr bool inp1 = IsIdentityPerm<typename CONFIG_T::tpose_inp1_config>::value && (K == C);
+    // A partial free dim needs the K-padded *and* tile-padded workspace buffer (the
+    // matmul loads full tiles from the zero-filled tail), so its copy is no longer a
+    // byte-identical view of the raw tensor -> cannot skip.
+    static constexpr bool inp0 = IsIdentityPerm<typename CONFIG_T::tpose_inp0_config>::value
+                                 && (K == C) && !MatmulGeom<CONFIG_T>::A_PADDED;
+    static constexpr bool inp1 = IsIdentityPerm<typename CONFIG_T::tpose_inp1_config>::value
+                                 && (K == C) && !MatmulGeom<CONFIG_T>::B_PADDED;
 };
 
 template <typename data_T, typename CONFIG_T>
@@ -1447,6 +1496,13 @@ __global__ AICORE void einsum_fused_kernel(
                     transpose_inline_rowpad<data_T, typename CONFIG_T::tpose_inp1_config, C, K, L1>(
                         data1, ws1, lane, nlanes);
                 }
+            } else if constexpr (MatmulGeom<CONFIG_T>::B_PADDED) {
+                // Partial N (requires I==1): pad the innermost free dim L1 up to the
+                // tile-aligned Na so the matmul reads a full Nt-col tile from the
+                // zero-filled tail. (For K!=C the row tail still sits in the pre-zeroed
+                // rows C..K of the K-tall ws1 slot.)
+                transpose_inline<data_T, typename CONFIG_T::tpose_inp1_config, L1,
+                                 MatmulGeom<CONFIG_T>::Na>(data1, ws1, lane, nlanes);
             } else {
                 transpose_inline<data_T, typename CONFIG_T::tpose_inp1_config>(data1, ws1, lane, nlanes);
             }
@@ -1489,14 +1545,18 @@ __global__ AICORE void einsum_fused_kernel(
 // This hoists aclrtMalloc/Memset/Free and the host-device sync out of the hot path
 // (they dominate these sub-0.1 ms kernels). einsum() keeps the one-shot all-in-one.
 
-// Workspace element counts: [ws0 (I*L0*K) | ws1 (I*K*L1) | ws_res (out, float)].
+// Workspace element counts: [ws0 (I*Arows*K) | ws1 (I*K*Bcols) | ws_res (out, float)].
+// Arows/Bcols are the K-padded free extents, themselves padded up to a whole tile when
+// the dim is partial (A_PADDED/B_PADDED) so the matmul can load full tiles.
 template <typename data_T, typename CONFIG_T>
 inline size_t einsum_ws0_elems() {
-    return size_t(CONFIG_T::n_inplace) * CONFIG_T::n_free0 * ((CONFIG_T::n_contract + 15) / 16 * 16);
+    using G = MatmulGeom<CONFIG_T>;
+    return size_t(G::I) * G::Arows * G::K;
 }
 template <typename data_T, typename CONFIG_T>
 inline size_t einsum_ws1_elems() {
-    return size_t(CONFIG_T::n_inplace) * ((CONFIG_T::n_contract + 15) / 16 * 16) * CONFIG_T::n_free1;
+    using G = MatmulGeom<CONFIG_T>;
+    return size_t(G::I) * G::K * G::Bcols;
 }
 
 // Allocate the workspace once and zero the pad regions once. The per-call
@@ -1528,11 +1588,16 @@ void* einsum_setup(void* stream = nullptr) {
     void* workspace = nullptr;
     aclrtMalloc(&workspace, total, ACL_MEM_MALLOC_NORMAL_ONLY);
 
-    if constexpr (K != C) {
+    // Zero the pad regions once: the contraction pad (K!=C) for both, plus the
+    // tile-row/col pad (A_PADDED/B_PADDED) the matmul reads as a full-tile zero tail.
+    // The per-call transposes only overwrite the data region, so the zeroing holds.
+    constexpr bool ZERO0 = (K != C) || MatmulGeom<CONFIG_T>::A_PADDED;
+    constexpr bool ZERO1 = (K != C) || MatmulGeom<CONFIG_T>::B_PADDED;
+    if constexpr (ZERO0 || ZERO1) {
         data_T* ws0 = reinterpret_cast<data_T*>(workspace);
         data_T* ws1 = reinterpret_cast<data_T*>(ws0 + ws0_elems);
-        aclrtMemsetAsync(ws0, ws0_bytes, 0, ws0_bytes, stream);
-        aclrtMemsetAsync(ws1, ws1_bytes, 0, ws1_bytes, stream);
+        if constexpr (ZERO0) aclrtMemsetAsync(ws0, ws0_bytes, 0, ws0_bytes, stream);
+        if constexpr (ZERO1) aclrtMemsetAsync(ws1, ws1_bytes, 0, ws1_bytes, stream);
         aclrtSynchronizeStream(stream);  // pad must be zero before the first exec
     }
     return workspace;

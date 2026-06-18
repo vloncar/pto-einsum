@@ -224,7 +224,10 @@ class EinsumBuilder:
         Mt, Nt = min(tile, Mpad), min(tile, Npad)
         Kt = self._tile_k(tile, L0, L1, C)
         nK = Kpad // Kt
-        total_tiles = I * (Mpad // Mt) * (Npad // Nt)
+        # Match MatmulGeom's full-tile grid: a partial free dim is padded up to a whole
+        # tile (Ma/Na), so the tile count ceils over the padded dim.
+        ceil = lambda a, b: -(-a // b)
+        total_tiles = I * ceil(Mpad, Mt) * ceil(Npad, Nt)
         return out_identity and nK >= 2 and total_tiles < 16
 
     def einsum_config_gen(self, tpose_inp0_name: str, tpose_inp1_name: str, tpose_out_name: str):
@@ -252,6 +255,24 @@ class EinsumBuilder:
             raise ValueError("Only exactly two input shapes are supported.")
         shape0, shape1 = self.input_shapes
         self.recipe = self.parse_recipe(self.equation, shape0, shape1)
+
+        # Partial output tiles (a free dim not a multiple of the matmul tile) need the
+        # operands padded up to a whole tile, which currently only has a single-batch
+        # layout — so reject batched (I>1) partial configs with a clean error rather
+        # than a kernel static_assert. The contraction dim never gates (tile_k divides
+        # padded K); only the free dims L0/L1 matter.
+        L0, L1, I = self.recipe['L0'], self.recipe['L1'], self.recipe['I']
+        if I > 1:
+            pad16 = lambda x: (x + 15) // 16 * 16
+            tile = int(os.getenv("EINSUM_TILE_SIZE", "128"))
+            Mpad, Npad = pad16(L0), pad16(L1)
+            Mt, Nt = min(tile, Mpad), min(tile, Npad)
+            if Mpad % Mt != 0 or Npad % Nt != 0:
+                raise ValueError(
+                    f"batched einsum (I={I}) requires each output free dim to be a "
+                    f"multiple of the matmul tile ({tile}) once padded to 16; got "
+                    f"L0={L0} (Mpad={Mpad}), L1={L1} (Npad={Npad}). Partial tiles are "
+                    f"currently single-batch (I==1) only.")
 
     def generate_code(self):
         # Determine C++ and ctypes type mappings
