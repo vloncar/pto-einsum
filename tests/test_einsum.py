@@ -29,6 +29,22 @@ from pto_einsum import einsum, EinsumBuilder
     # batched non-16-aligned contraction (K != C and I > 1): exercises the
     # per-batch K-row repack of ws1 (batched_pad_copy_inline). j=20 -> K=32.
     ("bij, bjk -> bik", (8, 16, 20), (8, 20, 64)),
+    # multi-batch-axis contractions (two inplace axes, e.g. batch + heads): the
+    # operands need an N-D non-identity transpose into the [batch, free, contract]
+    # matmul layout. Exercises both Phase-1 N-D transpose paths -- innermost-
+    # preserved strided gather (inputs/output whose inner axis is unchanged) and
+    # the batched 2D TTRANS (an input whose inner axis moves) -- plus a non-
+    # identity *output* permutation. d=64 keeps it exact in fp16 too.
+    ("bshd, bthd -> bsht", (4, 16, 8, 64), (4, 16, 8, 64)),  # attention scores
+    ("bsht, bthd -> bshd", (4, 16, 8, 16), (4, 16, 8, 64)),  # attention context
+    ("bshd, hdk -> bshk", (4, 16, 8, 64), (8, 64, 64)),      # per-head rotation
+    # elementwise (Hadamard) multiply: no contracted index, identical index order on
+    # both inputs and the output. Routed to the dedicated elementwise kernel instead
+    # of a batch of degenerate 1x1x1 matmuls. Sizes chosen to exercise the streaming
+    # tail (1000 < one 2048 tile) and the multi-chunk / multi-lane path (3072 > tile).
+    ("i, i -> i", (1000,), (1000,)),               # 1D, sub-tile tail
+    ("ts, ts -> ts", (64, 48), (64, 48)),          # 2D, spans two chunks
+    ("bshd, bshd -> bshd", (2, 16, 8, 64), (2, 16, 8, 64)),  # N-D Hadamard
     # non-16-aligned *free* dims (identity layout, no transpose): the padded M/N
     # exceed the real L0/L1, so the matmul emits partial output tiles whose
     # dynamic SetValidRow/SetValidCol extents differ across tiles (e.g. M tiles
@@ -62,6 +78,30 @@ def test_einsum_correctness(equation, shape0, shape1, dtype):
         atol = 1e-7
     
     torch.testing.assert_close(result, expected, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_linear_attention_chain(dtype):
+    # Linear attention `einsum("tn,sn,sp,ts->tp", Q,K,V,L)` expressed as the three
+    # two-way contractions it decomposes into. The middle step is the L-mask
+    # Hadamard `ts,ts->ts`, which exercises the elementwise kernel; the outer two
+    # are ordinary matmuls. Validates the whole chain against torch's 4-way einsum.
+    if TEST_DEVICE == "cpu" and dtype == torch.float16:
+        pytest.skip("float16 is not supported on CPU")
+
+    T, S, N, P = 96, 96, 64, 128   # TS = 9216 >= the elementwise kernel threshold
+    Q = torch.rand(T, N, dtype=dtype, device=TEST_DEVICE)
+    K = torch.rand(S, N, dtype=dtype, device=TEST_DEVICE)
+    V = torch.rand(S, P, dtype=dtype, device=TEST_DEVICE)
+    L = torch.tril(torch.ones(T, S, dtype=dtype, device=TEST_DEVICE))
+
+    A = einsum("tn, sn -> ts", Q, K, device=TEST_DEVICE).to(dtype)
+    A = einsum("ts, ts -> ts", A, L, device=TEST_DEVICE).to(dtype)   # elementwise step
+    O = einsum("ts, sp -> tp", A, V, device=TEST_DEVICE)
+
+    ref = torch.einsum("tn,sn,sp,ts->tp", Q.float(), K.float(), V.float(), L.float())
+    rtol, atol = (1e-3, 1e-3) if dtype == torch.float32 else (5e-2, 5e-2)
+    torch.testing.assert_close(O.float(), ref, rtol=rtol, atol=atol)
 
 
 def test_builder_reuse():

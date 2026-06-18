@@ -33,6 +33,19 @@ c = einsum("ij, jk -> ik", a, b)        # runs on the NPU, returns an NPU tensor
   scalar element copy — a large speedup on transposing equations. It is general
   for `float32`/`float16`; large *unaligned* 2D transposes are not yet supported.
   The blocked (large-tensor) transpose is distributed across all Vector cores.
+- **Multi-batch-axis contractions.** Equations with two or more batch axes (batch
+  + heads, e.g. attention `bshd, bthd -> bsht`) need an N-D non-identity transpose
+  into the canonical `[batch, free, contract]` layout. These are handled by a
+  strided gather (when the innermost axis is preserved) or a batched 2D `TTRANS`
+  (when it moves), for the 16-aligned-contraction (`K==C`) case.
+- **Elementwise (Hadamard) products.** An einsum with no contracted index and the
+  same index order on both inputs and the output (e.g. `ts, ts -> ts` — the decay/
+  mask step of linear attention `einsum("tn,sn,sp,ts->tp", …)` written as three
+  two-way contractions) is a pure elementwise multiply, not a matmul. It is routed
+  to a dedicated streaming Vector kernel (across all cores, any size) instead of a
+  batch of degenerate 1×1×1 matmuls. Output is `float32`; `float16` inputs are
+  up-cast and multiplied in float. Any `N` is handled directly — each block carries
+  a dynamic valid extent so the short tail needs no padding or size floor.
 - **Single fused kernel.** The transpose → matmul → transpose pipeline runs in one
   mix-kernel launch (Cube + Vector cores cooperating, full cross-core barriers via
   FFTS) instead of four separate launches — removing launch overhead and host
@@ -127,7 +140,7 @@ pto-einsum/
 │       ├── pto_einsum.h   # NPU kernels (transpose + tiled Cube matmul)
 │       └── cpu_einsum.h   # CPU reference kernels
 ├── tests/                 # pytest suites (einsum, split, transpose, python ref)
-├── benchmarks/            # bench_einsum.py, debug_einsum.py
+├── benchmarks/            # bench_einsum.py, bench_llm_contractions.py, debug_einsum.py
 ├── IMPLEMENTATION.md      # kernel design notes
 ├── pyproject.toml / setup.cfg / setup.py
 └── requirements.txt
@@ -158,6 +171,19 @@ With no argument all benchmarks run; pass a benchmark name to run just one
 `contraction`, `custom-layout`, `unaligned`, `batch-unaligned`). Plots are
 written to `benchmarks/bench_results/`: one image per benchmark plus a
 `summary.png` showing each pattern's mean speedup with its min/max range.
+
+A second script benchmarks realistic LLM contraction patterns (attention,
+SwiGLU, LoRA, MoE, RoPE, logits, …) against `torch.einsum`:
+
+```bash
+python benchmarks/bench_llm_contractions.py
+```
+
+Each pattern is written once as an einsum expression and run with both
+`torch.einsum` and the custom kernel, reporting correctness (relative diff) and
+per-pattern timing. Patterns the kernel does not yet cover (e.g. contractions
+needing a non-identity transpose of a >2D operand, or pure broadcast/scaling
+ops) are listed as `unsupported` with the reason.
 
 > **Note:** the JIT build cache keys only on the generated `.cpp` (config), not on
 > the bundled headers. If you edit `src/pto_einsum/include/*.h`, delete the build

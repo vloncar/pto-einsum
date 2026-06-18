@@ -82,4 +82,13 @@ void einsum(const data_T data0[CONFIG_T::tpose_inp0_config::N], const data_T dat
     cpu::transpose<float, typename CONFIG_T::tpose_out_conf>(tpose_o.data(), res);
 }
 
+// Elementwise (Hadamard) multiply: res[i] = in0[i] * in1[i]. The no-contraction
+// einsum case (e.g. `TS,TS->TS`), routed here instead of the matmul path.
+template <typename data_T, typename CONFIG_T>
+void elementwise_mul(const data_T* in0, const data_T* in1, float* res) {
+    for (unsigned i = 0; i < CONFIG_T::N; i++) {
+        res[i] = static_cast<float>(in0[i]) * static_cast<float>(in1[i]);
+    }
+}
+
 } // namespace cpu

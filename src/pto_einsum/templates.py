@@ -26,6 +26,48 @@ einsum_config_template = """struct config_einsum {{
     static const unsigned tile_k = {tile_k};
 }};
 """
+elementwise_config_template = """struct config_elementwise {{
+    static const unsigned N = {N};
+}};
+"""
+
+# Elementwise (Hadamard) variant. Exposes the SAME extern "C" entry-point names as
+# the matmul path (run_einsum / run_einsum_setup / exec / teardown) so builder.py's
+# dispatch is unchanged; only the bodies call the elementwise kernels. The
+# transpose / batched_matmul entry points are intentionally absent (there is no
+# transpose or matmul), so builder.load_library skips their argtypes for this path.
+shared_lib_elementwise_template = """#include "pto_einsum.h"
+
+{config_code}
+
+extern "C" {{
+    void run_einsum(const {data_t}* input0, const {data_t}* input1, float* output, void* stream) {{
+        pto_einsum::elementwise_mul<{data_t}, config_elementwise>(input0, input1, output, stream);
+    }}
+    void* run_einsum_setup(void* stream) {{
+        return pto_einsum::elementwise_setup(stream);
+    }}
+    void run_einsum_exec(const {data_t}* input0, const {data_t}* input1, float* output, void* workspace, void* stream) {{
+        pto_einsum::elementwise_exec<{data_t}, config_elementwise>(input0, input1, output, workspace, stream);
+    }}
+    void run_einsum_teardown(void* workspace) {{
+        pto_einsum::einsum_teardown(workspace);
+    }}
+}}
+"""
+
+cpu_lib_elementwise_template = """#include "cpu_einsum.h"
+#include <stdio.h>
+
+{config_code}
+
+extern "C" {{
+    void run_einsum(const {data_t}* input0, const {data_t}* input1, float* output, void* stream) {{
+        cpu::elementwise_mul<{data_t}, config_elementwise>(input0, input1, output);
+    }}
+}}
+"""
+
 shared_lib_template = """#include "pto_einsum.h"
 
 {tpose_inp0_code}

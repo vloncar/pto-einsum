@@ -48,6 +48,13 @@ The Python layer is a dynamic JIT compiler and launcher.
   stack of matrices), input1 → `[inplace, contract, invariant1]` (an `I·C × L1`
   stack). The flattened products `L0`, `L1`, `C`, `I` are the matmul dims.
 
+  **Elementwise special case.** When both inputs and the output carry the *same
+  index list in the same order* (e.g. `ts, ts -> ts`) there is no contracted index
+  (`C == 1`), no transpose and no broadcast — the einsum is a pure Hadamard product
+  `res[i] = in0[i] * in1[i]`. `parse_recipe` flags this (`recipe.elementwise`) and
+  routes it — for any `N` — to a dedicated elementwise kernel instead of the matmul
+  pipeline (which would otherwise issue `N` degenerate `1×1×1` matmuls). See §1.3.
+
 - **Configuration generation** (`transpose_config_gen`, `einsum_config_gen`):
   emits compile-time C++ structs describing the source/destination shapes, the
   permutation and its strides for each transpose, and the matmul dims plus the
@@ -88,14 +95,18 @@ kernel calls `set_ffts_base_addr` before the barriers.
 ### Phases A & C — Vector-core transpose
 
 Each operand (and, in the general case, the final result) is reordered by a
-Vector-core kernel. Two paths:
+Vector-core kernel. The dispatch (`transpose_inline`) has these paths:
 
-- **Identity permutation** → a straight tiled copy through the Unified Buffer
-  (UB), 128 elements at a time (`transpose_copy_inline`). Handles arbitrary
+- **Identity permutation** (any rank) → a straight tiled copy through the Unified
+  Buffer (UB), 128 elements at a time (`transpose_copy_inline`). Handles arbitrary
   lengths.
 - **2D non-identity permutation** → a **hardware** transpose via `TTRANS` (the
   PTO `vnchwconv`-based tile op). `TTRANS(dst, src, tmp)` transposes a RowMajor
   `src` UB tile into a `dst` UB tile using a scratch `tmp` tile.
+- **N-D (rank > 2) non-identity permutation** → see *N-D transposes* below. These
+  arise when an operand has two or more batch axes (e.g. attention's batch + heads,
+  `bshd,bthd->bsht`) and must be permuted into the canonical `[batch, free,
+  contract]` matmul layout.
 
 #### `TTRANS` — hardware tile transpose
 
@@ -141,6 +152,37 @@ implementation (`transpose_2d_inline`) has two structural cases:
 So the cases are: (1) any tensor that fits UB → fully general hardware transpose;
 (2) large 16-aligned tensors → blocked hardware transpose; (3) large *unaligned*
 tensors → not yet supported (blocked by the GM-DMA alignment, not by `TTRANS`).
+
+#### N-D transposes
+
+The Cube matmul already flattens *all* batch (`n_inplace`) axes into one batch
+loop, so an einsum with multiple batch axes (batch + heads, …) needs nothing new
+from the contraction — only an N-D-aware Phase A/C. A permutation that maps the
+operand into the grouped `[batch, free, contract]` layout always has one of two
+shapes, distinguished by the innermost output axis. Both read the config's
+`to_shape` (output extents) and `perm_strides` (each output axis' source stride):
+for any permutation the contiguous output block over the trailing axes maps to a
+strided source block, so the **destination stays the natural matmul layout** and
+only the source side carries the permutation.
+
+- **Innermost axis preserved** (`perm[dims-1] == dims-1`) → a strided gather
+  (`transpose_nd_copy_inline`): each contiguous inner run is copied to its natural
+  dst slot, its source base offset the mixed-radix sum of the outer indices times
+  `perm_strides`. No element transpose. Covers the inputs/output whose inner axis
+  is unchanged (e.g. `bshd→bhsd`, contract `d` stays innermost). Inherits the
+  `DST_PAD` contract-padding the 2D path uses.
+- **Innermost axis changes** → a **batched** 2D `TTRANS`
+  (`transpose_nd_batched_2d_inline`): the trailing two output axes form the
+  transpose, all leading axes are batch. Per batch the `[Bb, A]` strided source
+  block (row stride `perm_strides[-1]`, the second-innermost axis source-
+  contiguous) is `TTRANS`-d into its contiguous `[A, Bb]` dst slot
+  (`ttrans_block_inline`, the 2D fits-UB body parameterised by strides). Batches
+  are distributed across the Vec lanes.
+
+Phase 1 covers `K==C` (the contraction already 16-aligned, the common case for
+attention where `head_dim` is a multiple of 16); the contract-padding interaction
+with a *transposed* input (the batched-`TTRANS` case) and per-batch inner tiles
+too large for UB are left to a later phase (guarded by `static_assert`).
 
 ### Phase B — Cube-core tiled matmul
 
@@ -190,7 +232,29 @@ missed).
 ### CPU reference (`cpu_einsum.h`)
 
 A straightforward `transpose → triple-nested-loop matmul → transpose` in plain
-C++, used to validate the NPU path. FP32 only.
+C++, used to validate the NPU path. FP32 only. The elementwise path has its own
+trivial reference (`cpu::elementwise_mul`).
+
+## 1.3 Elementwise (Hadamard) path (`elementwise_mul_inline`)
+
+The no-contraction case (`ts, ts -> ts`, etc.; see §1.1) bypasses the
+transpose/matmul pipeline entirely. The flat element range `[0, N)` is streamed
+through UB in fixed-width blocks (`elementwise_mul_block`): load both operands,
+multiply, store the `float` result. `float16` inputs are up-cast to `float` with
+`TCVT` and multiplied in float (the matmul path likewise accumulates fp16 in
+float), so the output is always `float32`. Blocks are distributed across all Vector
+cores; each core takes a contiguous span, processing it in `TILE`-wide blocks whose
+final block carries a dynamic valid extent for the short tail — so any `N` works
+with no padding and no size floor.
+
+The one subtlety is on the fp16 path: the up-cast is two `TCVT`s into `af`/`bf`
+followed by an in-place `TMUL` that reads them, which is a read-after-write hazard on
+the Vector pipe. A `pipe_barrier(PIPE_V)` between the converts and the multiply is
+required; without it the `TMUL` can read pre-convert data. On a large tile the
+multi-repeat `TCVT` latency hides the window, which is why this once looked like a
+"small/partial-tile fp16 hardware quirk" — it is not. Bare `TCVT` is correct at every
+size; an isolating reproducer (single op, properly synced) is in
+`bug_report/FINDINGS.md`. fp32 has no `TCVT`, so no intra-`V` hazard.
 
 ---
 
@@ -260,8 +324,12 @@ This removes a whole Vec copy pass, one cross-core barrier, and the output-buffe
 allocation for the typical matmul. It is correct because the matmul writes every
 real `M×N` output element (partial tiles still cover the full real output), so the
 `res` buffer is fully written. Only non-identity outputs (e.g. some `ai,ja->ij`
-layouts) still run Phase C. Its input-side mirror — skipping the redundant *input*
-copies — is §2.8.
+layouts, or a multi-batch-axis result like `bshd,bthd->bsht`) still run Phase C.
+Phase C writes `res` in the **final** (post-permutation) order, so the runner
+allocates the output torch tensor with the true output shape (`recipe.out_shape`),
+not the matmul-natural `out_interpret_shape` — the two differ exactly when the
+output permutation is non-identity. Its input-side mirror — skipping the redundant
+*input* copies — is §2.8.
 
 ## 2.4 L1 Mat-tile double buffering
 

@@ -23,6 +23,16 @@ class EinsumRecipe(TypedDict):
     C: int
     out_interpret_shape: tuple[int, ...]
     out_transpose_idxs: tuple[int, ...]
+    # The true (post-transpose) output shape, i.e. out_interpret_shape permuted by
+    # out_transpose_idxs. The kernel always writes `res` in this final order; only
+    # for an identity output perm does it coincide with out_interpret_shape.
+    out_shape: tuple[int, ...]
+    # Pure elementwise (Hadamard) multiply: no contracted index, identical index
+    # order on both inputs and the output (e.g. `TS,TS->TS`). Routed to the
+    # elementwise kernel instead of the transpose->matmul->transpose pipeline; the
+    # matmul fields above are then unused. n_elem is the total element count.
+    elementwise: bool
+    n_elem: int
 
 class EinsumBuilder:
     def __init__(self, equation: str, input_shapes: list[tuple[int, ...]], dtype: torch.dtype, device: str = "npu"):
@@ -146,12 +156,32 @@ class EinsumBuilder:
         return f'{in0},{in1}->{out}', out_shape
 
     def parse_recipe(self, fn: str, input_shape0: tuple[int, ...], input_shape1: tuple[int, ...]) -> EinsumRecipe:
-        fn, _ = self._validate_einsum_expr(fn, input_shape0, input_shape1)
+        fn, out_shape = self._validate_einsum_expr(fn, input_shape0, input_shape1)
 
         _in, _out = fn.split('->')
         _in0, _in1 = _in.split(',')
 
         in0, in1, out = list(_in0), list(_in1), list(_out)
+
+        # Pure elementwise (Hadamard) multiply: identical index order on both inputs
+        # and the output => no contracted index, no transpose, no broadcast, so
+        # res[i] = in0[i] * in1[i] over the flat buffers. Route to the elementwise
+        # kernel rather than emitting a batch of degenerate 1x1x1 matmuls. The
+        # matmul-oriented recipe fields are filled with neutral values (unused). Any N
+        # is handled directly: the kernel's per-block dynamic valid extent covers the
+        # short tail, so there is no minimum-size fallback.
+        if in0 == in1 == out:
+            return EinsumRecipe(
+                direct_sum_axis=((), ()),
+                in_transpose_idxs=((), ()),
+                out_interpret_shape=out_shape,
+                out_transpose_idxs=tuple(range(len(out_shape))),
+                out_shape=out_shape,
+                L0=1, L1=1, I=prod(out_shape), C=1,
+                elementwise=True,
+                n_elem=prod(out_shape),
+            )
+
         s_in0, s_in1, s_out = set(in0), set(in1), set(out)
         _common = s_in0 & s_in1
         _contract = _common - s_out
@@ -196,10 +226,13 @@ class EinsumBuilder:
             in_transpose_idxs=(transpose_idx0, transpose_idx1),
             out_interpret_shape=out_shape_pretranspose,
             out_transpose_idxs=out_transpose_idx,
+            out_shape=out_shape,
             L0=invariant_size0,
             L1=invariant_size1,
             I=inplace_size,
             C=contract_size,
+            elementwise=False,
+            n_elem=prod(out_shape),
         )
 
     def transpose_config_gen(self, name: str, shape: tuple[int, ...], perm: tuple[int, ...]):
@@ -297,6 +330,18 @@ class EinsumBuilder:
             self.c_type = ctypes.c_uint16
         else:
             raise TypeError(f"Unsupported torch dtype: {self.dtype}")
+
+        # Elementwise (Hadamard) path: a single config + a kernel call, no transpose
+        # or matmul configs. Reuses the run_einsum* entry-point names so the dispatch
+        # in run()/load_library is unchanged.
+        if self.recipe['elementwise']:
+            config_code = templates.elementwise_config_template.format(N=self.recipe['n_elem'])
+            tmpl = templates.cpu_lib_elementwise_template if self.device == "cpu" \
+                else templates.shared_lib_elementwise_template
+            self.cpp_code = tmpl.format(config_code=config_code, data_t=data_t)
+            self.code_hash = hashlib.md5(self.cpp_code.encode('utf-8')).hexdigest()
+            self.target_dir = os.path.join(self.build_base, self.code_hash)
+            return
 
         shape0, shape1 = self.input_shapes
         tpose_inp0_name = 'config_tpose_inp0'
@@ -432,7 +477,9 @@ extern "C" {{
             ctypes.c_void_p               # stream
         ]
         
-        if self.device == "npu":
+        # The elementwise path exposes only the run_einsum* entry points (no
+        # transpose / batched_matmul symbols exist in its .so), so skip their setup.
+        if self.device == "npu" and not self.recipe['elementwise']:
             self.lib.run_transpose_inp0.argtypes = transpose_sig
             self.lib.run_transpose_inp0.restype = None
             
@@ -485,7 +532,8 @@ extern "C" {{
 
         # Split-K configs have the cores atomic-add into the output, so it must start
         # zeroed (see _splitk_eligible). self.recipe is populated by generate_code().
-        self._splitk = self._splitk_eligible()
+        # The elementwise path has no matmul, so it is never split-K.
+        self._splitk = False if self.recipe['elementwise'] else self._splitk_eligible()
 
         # Return a Callable wrapper that validates inputs
         def run(*operands):
@@ -510,17 +558,17 @@ extern "C" {{
                 inp1 = inp1.contiguous()
 
             if self.device == "cpu":
-                output_tensor_npu = torch.zeros(self.recipe['out_interpret_shape'], dtype=torch.float32, device="cpu")
+                output_tensor_npu = torch.zeros(self.recipe['out_shape'], dtype=torch.float32, device="cpu")
                 stream_ptr = None
             elif self._splitk:
                 # Split-K cores atomic-add their K-slices into the output, so it must
                 # start zeroed. torch.zeros runs on the same stream before the kernel,
                 # so ordering holds without an explicit sync.
-                output_tensor_npu = torch.zeros(self.recipe['out_interpret_shape'], dtype=torch.float32, device="npu")
+                output_tensor_npu = torch.zeros(self.recipe['out_shape'], dtype=torch.float32, device="npu")
                 stream_ptr = torch.npu.current_stream()._as_parameter_
             else:
                 # The kernel writes every output element, so skip zero-init.
-                output_tensor_npu = torch.empty(self.recipe['out_interpret_shape'], dtype=torch.float32, device="npu")
+                output_tensor_npu = torch.empty(self.recipe['out_shape'], dtype=torch.float32, device="npu")
                 stream_ptr = torch.npu.current_stream()._as_parameter_
 
             in0_ptr = ctypes.cast(inp0.data_ptr(), ctypes.POINTER(self.c_type))
