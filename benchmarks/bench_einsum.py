@@ -3,6 +3,7 @@ import os
 import statistics
 import time
 
+import torch_npu  # noqa: F401  (registers the 'npu' device)
 import torch
 from pto_einsum import EinsumBuilder
 

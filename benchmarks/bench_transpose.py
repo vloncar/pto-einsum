@@ -7,7 +7,7 @@ einsums in bench_einsum.py. Large dims push both inputs through the blocked path
 import os
 import time
 import torch
-import torch_npu
+import torch_npu  # noqa: F401  (registers the 'npu' device)
 from pto_einsum import EinsumBuilder
 
 CASES = [
