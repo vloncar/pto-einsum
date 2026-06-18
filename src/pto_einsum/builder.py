@@ -15,7 +15,6 @@ from . import templates
 INCLUDE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "include")
 
 class EinsumRecipe(TypedDict):
-    direct_sum_axis: tuple[tuple[int, ...], tuple[int, ...]]
     in_transpose_idxs: tuple[tuple[int, ...], tuple[int, ...]]
     L0: int
     L1: int
@@ -66,84 +65,29 @@ class EinsumBuilder:
     def _validate_einsum_expr(self, fn: str, shape0: tuple[int, ...], shape1: tuple[int, ...]):
         inp, out = map(str.strip, fn.split('->'))
         in0, in1 = map(str.strip, inp.split(','))
-        alphabets = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
-        s_alphabets = set(alphabets)
+        s_alphabets = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')
 
-        if not (s_alphabets >= set(in0.replace('...', '') + in1.replace('...', '') + out.replace('...', ''))):
-            raise ValueError(f"einsum string {fn} is invalid: subscripts should be in [a-zA-Z] and '...' only")
+        # Only named axes [a-zA-Z] are accepted; broadcasting ('...') is not supported.
+        if not (s_alphabets >= set(in0 + in1 + out)):
+            raise ValueError(f"einsum string {fn} is invalid: subscripts should be in [a-zA-Z]")
 
-        in0 = in0.replace('...', '0')
-        in1 = in1.replace('...', '0')
-        out = out.replace('...', '0')
         ax_in0, ax_in1, ax_out = list(in0), list(in1), list(out)
         sax_in0, sax_in1, sax_out = set(ax_in0), set(ax_in1), set(ax_out)
-        free_indices = ''.join(sorted(s_alphabets - sax_in0 - sax_in1 - sax_out))
 
-        if len(sax_in0) != len(ax_in0):
-            for a in in0:
-                if in0.count(a) == 1:
-                    continue
-                a = a if a != '0' else '...'
-                raise ValueError(f"einsum string {fn} is invalid: input0 subscripts includes '{a}' multiple times")
-        if len(sax_in1) != len(ax_in1):
-            for a in in1:
-                if in1.count(a) == 1:
-                    continue
-                a = a if a != '0' else '...'
-                raise ValueError(f"einsum string {fn} is invalid: input1 subscripts includes '{a}' multiple times")
-        if len(sax_out) != len(ax_out):
-            for a in out:
-                if out.count(a) == 1:
-                    continue
-                a = a if a != '0' else '...'
-                raise ValueError(f"einsum string {fn} is invalid: output subscripts includes '{a}' multiple times")
-
-        if '0' in sax_in0 or '0' in sax_in1 or '0' in sax_out:
-            if '0' not in sax_out:
-                raise ValueError(f'einsum string {fn} is invalid: output does not allow broadcasting, but inputs do')
-            if '0' not in sax_in0 and '0' not in sax_in1:
-                raise ValueError(f'einsum string {fn} is invalid: output allows broadcasting, but inputs do not')
+        for label, subs in (("input0", in0), ("input1", in1), ("output", out)):
+            for a in subs:
+                if subs.count(a) > 1:
+                    raise ValueError(f"einsum string {fn} is invalid: {label} subscripts includes '{a}' multiple times")
 
         if remaining := sax_out - sax_in0 - sax_in1:
             raise ValueError(f'einsum string {fn} is invalid: output subscripts {remaining} not found in inputs')
 
+        if len(sax_in0) != len(shape0):
+            raise ValueError(f'Input0 requires {len(sax_in0)} dimensions, but {len(shape0)} is given')
+        if len(sax_in1) != len(shape1):
+            raise ValueError(f'Input1 requires {len(sax_in1)} dimensions, but {len(shape1)} is given')
+
         _common_in = sax_in0 & sax_in1
-
-        if '0' in sax_in0 and '0' in sax_in1:
-            n_boardcast0 = len(shape0) - len(sax_in0) + 1
-            n_boardcast1 = len(shape1) - len(sax_in1) + 1
-            assert n_boardcast0 == n_boardcast1, f"'...' expands to {n_boardcast0} and {n_boardcast1}-axis in input0 and input1."
-            in0 = in0.replace('0', free_indices[:n_boardcast0])
-            in1 = in1.replace('0', free_indices[:n_broadcast1])
-            out = out.replace('0', free_indices[:n_boardcast0])
-            ax_in0, ax_in1, ax_out = list(in0), list(in1), list(out)
-            _common_in = set(ax_in0) & set(ax_in1)
-
-        else:
-            if '0' in sax_in0:
-                if len(sax_in0) - 1 > len(shape0):
-                    raise ValueError(f'Input0 requires at least {len(sax_in0) - 1} dimensions, but only {len(shape0)} given')
-                n_broadcast = len(shape0) - len(sax_in0) + 1
-                in0 = in0.replace('0', free_indices[:n_broadcast])
-                out = out.replace('0', free_indices[:n_broadcast])
-                ax_in0 = list(in0)
-                ax_out = list(out)
-            else:
-                if len(sax_in0) != len(shape0):
-                    raise ValueError(f'Input0 requires {len(sax_in0)} dimensions, but {len(shape0)} is given')
-
-            if '0' in sax_in1:
-                if len(sax_in1) - 1 > len(shape1):
-                    raise ValueError(f'Input1 requires at least {len(sax_in1) - 1} dimensions, but only {len(shape1)} given')
-                n_broadcast = len(shape1) - len(sax_in1) + 1
-                in1 = in1.replace('0', free_indices[:n_broadcast])
-                out = out.replace('0', free_indices[:n_broadcast])
-                ax_in1 = list(in1)
-                ax_out = list(out)
-            else:
-                if len(sax_in1) != len(shape1):
-                    raise ValueError(f'Input1 requires {len(sax_in1)} dimensions, but {len(shape1)} is given')
-
         for a in _common_in:
             ax_0 = ax_in0.index(a)
             ax_1 = ax_in1.index(a)
@@ -172,7 +116,6 @@ class EinsumBuilder:
         # short tail, so there is no minimum-size fallback.
         if in0 == in1 == out:
             return EinsumRecipe(
-                direct_sum_axis=((), ()),
                 in_transpose_idxs=((), ()),
                 out_interpret_shape=out_shape,
                 out_transpose_idxs=tuple(range(len(out_shape))),
@@ -190,12 +133,6 @@ class EinsumBuilder:
         inplace = sorted(_inplace, key=lambda x: in1.index(x))
         invariant0 = sorted((s_out - _common) & s_in0, key=lambda x: in0.index(x))
         invariant1 = sorted((s_out - _common) & s_in1, key=lambda x: in1.index(x))
-        direct_sum0 = s_in0 - s_out - _common
-        direct_sum1 = s_in1 - s_out - _common
-        direct_sum_axis = (
-            tuple(sorted(in0.index(x) for x in direct_sum0)),
-            tuple(sorted(in1.index(x) for x in direct_sum1)),
-        )
 
         contract_idxs = tuple(map(in0.index, contract)), tuple(map(in1.index, contract))
         inplace_idxs = tuple(map(in0.index, inplace)), tuple(map(in1.index, inplace))
@@ -209,7 +146,6 @@ class EinsumBuilder:
         invariant_size0, invariant_size1 = prod(invariant_shape0), prod(invariant_shape1)
 
         transpose_idx0 = inplace_idxs[0] + invariant_idxs[0] + contract_idxs[0]
-        #transpose_idx1 = inplace_idxs[1] + invariant_idxs[1] + contract_idxs[1]
         transpose_idx1 = inplace_idxs[1] + contract_idxs[1] + invariant_idxs[1]
 
         out_shape_pretranspose = inplace_shape + invariant_shape0 + invariant_shape1
@@ -222,7 +158,6 @@ class EinsumBuilder:
         # L0/L1/C == 1) are supported.
 
         return EinsumRecipe(
-            direct_sum_axis=direct_sum_axis,
             in_transpose_idxs=(transpose_idx0, transpose_idx1),
             out_interpret_shape=out_shape_pretranspose,
             out_transpose_idxs=out_transpose_idx,
@@ -363,41 +298,17 @@ class EinsumBuilder:
         )
         einsum_code = templates.einsum_config_template.format(**einsum_dict)
 
-        if self.device == "cpu":
-            self.cpp_code = """#include "cpu_einsum.h"
-#include <stdio.h>
-
-{tpose_inp0_code}
-{tpose_inp1_code}
-{tpose_out_code}
-{einsum_code}
-
-extern "C" {{
-    void run_einsum(const {data_t}* input0, const {data_t}* input1, float* output, void* stream) {{
-        cpu::einsum<{data_t}, config_einsum>(input0, input1, output);
-    }}
-}}
-""".format(
-                tpose_inp0_code=tpose_inp0_code,
-                tpose_inp1_code=tpose_inp1_code,
-                tpose_out_code=tpose_out_code,
-                einsum_code=einsum_code,
-                data_t=data_t,
-                tpose_inp0_name=tpose_inp0_name,
-                tpose_inp1_name=tpose_inp1_name,
-                tpose_out_name=tpose_out_name
-            )
-        else:
-            self.cpp_code = templates.shared_lib_template.format(
-                tpose_inp0_code=tpose_inp0_code,
-                tpose_inp1_code=tpose_inp1_code,
-                tpose_out_code=tpose_out_code,
-                einsum_code=einsum_code,
-                data_t=data_t,
-                tpose_inp0_name=tpose_inp0_name,
-                tpose_inp1_name=tpose_inp1_name,
-                tpose_out_name=tpose_out_name,
-            )
+        tmpl = templates.cpu_lib_template if self.device == "cpu" else templates.shared_lib_template
+        self.cpp_code = tmpl.format(
+            tpose_inp0_code=tpose_inp0_code,
+            tpose_inp1_code=tpose_inp1_code,
+            tpose_out_code=tpose_out_code,
+            einsum_code=einsum_code,
+            data_t=data_t,
+            tpose_inp0_name=tpose_inp0_name,
+            tpose_inp1_name=tpose_inp1_name,
+            tpose_out_name=tpose_out_name,
+        )
 
         self.code_hash = hashlib.md5(self.cpp_code.encode('utf-8')).hexdigest()
         self.target_dir = os.path.join(self.build_base, self.code_hash)

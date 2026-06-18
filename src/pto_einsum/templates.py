@@ -68,6 +68,21 @@ extern "C" {{
 }}
 """
 
+cpu_lib_template = """#include "cpu_einsum.h"
+#include <stdio.h>
+
+{tpose_inp0_code}
+{tpose_inp1_code}
+{tpose_out_code}
+{einsum_code}
+
+extern "C" {{
+    void run_einsum(const {data_t}* input0, const {data_t}* input1, float* output, void* stream) {{
+        cpu::einsum<{data_t}, config_einsum>(input0, input1, output);
+    }}
+}}
+"""
+
 shared_lib_template = """#include "pto_einsum.h"
 
 {tpose_inp0_code}
