@@ -286,9 +286,12 @@ AICORE inline void transpose_2d_inline(__gm__ const data_T* src, __gm__ data_T* 
         constexpr unsigned subSrcTW = align_up(BC, blk);   // src sub-tile width  (RowStride)
         constexpr unsigned subDstTW = align_up(BR, 16u);   // dst/tmp sub-tile width (RowStride)
 
-        using SrcShape = pto::Shape<1, 1, 1, BR, BC>;
+        // DYNAMIC GM windows carry the real per-block dims (rb/cb), not the padded
+        // BR/BC -- a static window over-reads the source and over-writes neighbouring
+        // output on partial (non-BR/BC-multiple) boundary blocks. Set per block below.
+        using SrcShape = pto::Shape<1, 1, 1, -1, -1>;
         using SrcStride = pto::Stride<1, 1, 1, srcCols, 1>;
-        using DstShape = pto::Shape<1, 1, 1, BC, BR>;
+        using DstShape = pto::Shape<1, 1, 1, -1, -1>;
         using DstStride = pto::Stride<1, 1, 1, dpad, 1>;
         using SrcGlobal = GlobalTensor<data_T, SrcShape, SrcStride>;
         using DstGlobal = GlobalTensor<data_T, DstShape, DstStride>;
@@ -328,8 +331,8 @@ AICORE inline void transpose_2d_inline(__gm__ const data_T* src, __gm__ data_T* 
             srcTile.SetValidCol(cb);
             dstTile.SetValidRow(cb);
             dstTile.SetValidCol(rb);
-            SrcGlobal sg(const_cast<__gm__ data_T*>(src + r0 * srcCols + c0));
-            DstGlobal dg(dst + c0 * dpad + r0);
+            SrcGlobal sg(const_cast<__gm__ data_T*>(src + r0 * srcCols + c0), SrcShape(rb, cb));
+            DstGlobal dg(dst + c0 * dpad + r0, DstShape(cb, rb));
 
             TLOAD(srcTile, sg);
 
@@ -354,7 +357,7 @@ AICORE inline void transpose_2d_inline(__gm__ const data_T* src, __gm__ data_T* 
     }
 }
 
-// ─── N-D non-identity transpose (Phase 1) ────────────────────────────────────
+// ─── N-D non-identity transpose ──────────────────────────────────────────────
 // The 2D TTRANS path above covers rank-2 operands; einsums with two or more
 // batch axes (attention: bshd,bthd->bsht, …) need to permute a >2D operand into
 // the canonical [batch, free, contract] matmul layout. Such a permutation always
@@ -377,8 +380,15 @@ AICORE inline void transpose_2d_inline(__gm__ const data_T* src, __gm__ data_T* 
 // inner runs is copied (through UB) to its natural slot in the dst; its source
 // base offset is the mixed-radix sum of the outer indices times perm_strides.
 // PAD_INNER/PAD_STRIDE pad the destination inner stride (contract C -> K) exactly
-// like the 2D path; equal/zero ⇒ no padding. Runs are distributed across lanes.
-template <typename data_T, typename CONFIG_T, unsigned PAD_INNER = 0, unsigned PAD_STRIDE = 0>
+// like the 2D path -- used for an *input0* transpose (contract innermost); equal/
+// zero ⇒ no padding.
+// ROWS/PAD_BATCH express the orthogonal *input1* row pad: the last outer axis is
+// the contract row count (= ROWS = C), and each batch's ROWS valid rows must land
+// at the front of its PAD_BATCH (= K*L1)-wide slot. With ROWS>0 the dst run offset
+// becomes (g/ROWS)*PAD_BATCH + (g%ROWS)*dstStride; both 0 ⇒ contiguous (the default).
+// Runs are distributed across lanes.
+template <typename data_T, typename CONFIG_T, unsigned PAD_INNER = 0, unsigned PAD_STRIDE = 0,
+          unsigned ROWS = 0, unsigned PAD_BATCH = 0>
 AICORE inline void transpose_nd_copy_inline(__gm__ const data_T* src, __gm__ data_T* dst,
                                             unsigned lane, unsigned nlanes) {
     constexpr unsigned dims  = CONFIG_T::dims;
@@ -405,7 +415,9 @@ AICORE inline void transpose_nd_copy_inline(__gm__ const data_T* src, __gm__ dat
             rem /= e;
         }
         __gm__ const data_T* s = src + src_base;
-        __gm__ data_T* d = dst + (size_t)g * dstStride;
+        size_t doff = (ROWS > 0) ? (size_t)(g / ROWS) * PAD_BATCH + (size_t)(g % ROWS) * dstStride
+                                 : (size_t)g * dstStride;
+        __gm__ data_T* d = dst + doff;
         for (unsigned c = 0; c < inner; c += TILE_COLS) {
             unsigned w = (c + TILE_COLS) <= inner ? TILE_COLS : (inner - c);
             copy_chunk_through_ub<data_T, TILE_COLS>(ubTile, s + c, d + c, w);
@@ -427,7 +439,8 @@ AICORE inline void ttrans_block_inline(__gm__ const data_T* src, __gm__ data_T* 
     constexpr unsigned dstBytes = SC * dstTW * sizeof(data_T);
     constexpr unsigned tmpBytes = SC * tmpTW * sizeof(data_T);
     static_assert(srcBytes + dstBytes + tmpBytes <= 184u * 1024u,
-                  "ND inner transpose block must fit in UB (Phase 1: small per-batch tiles)");
+                  "ND inner transpose block must fit in UB (this is the small per-batch "
+                  "tile path; larger tiles take the blocked sub-tile path instead)");
 
     using SrcShape = pto::Shape<1, 1, 1, SR, SC>;
     using SrcStride = pto::Stride<1, 1, 1, SRC_RS, 1>;
@@ -464,12 +477,91 @@ AICORE inline void ttrans_block_inline(__gm__ const data_T* src, __gm__ data_T* 
     pipe_barrier(PIPE_ALL);  // drain before this lane reuses the UB for its next batch
 }
 
+// Dynamic-extent single sub-block TTRANS for the *blocked* N-D path: transpose one
+// [rb, cb] source sub-block (max BR x BC, row stride SRC_RS, unit col stride) into
+// its [cb, rb] dst (row stride DST_RS). The valid extents rb/cb are runtime (the
+// boundary sub-blocks of a per-batch [Bb, A] tile are partial). Self-contained
+// (own UB tiles, internal PIPE_ALL drain), so the caller just loops work items --
+// the blocked-path analogue of ttrans_block_inline.
+//
+// The GM windows carry the *real* dims (DYNAMIC Shape set to rb/cb), not the padded
+// BR/BC tile size, so a partial sub-block transfers exactly its valid region -- a
+// static BR x BC window would over-read the source and over-write neighbouring
+// output rows (mirrors the matmul's "GM windows carry real dims", Phase B).
+template <typename data_T, unsigned BR, unsigned BC, unsigned SRC_RS, unsigned DST_RS>
+AICORE inline void ttrans_block_dyn_inline(__gm__ const data_T* src, __gm__ data_T* dst,
+                                           unsigned rb, unsigned cb) {
+    constexpr unsigned blk = 32u / sizeof(data_T);
+    constexpr unsigned subSrcTW = align_up(BC, blk);   // src sub-tile width (RowStride)
+    constexpr unsigned subDstTW = align_up(BR, 16u);   // dst/tmp sub-tile width (RowStride)
+    constexpr unsigned subSrcBytes = BR * subSrcTW * sizeof(data_T);
+    constexpr unsigned subDstBytes = BC * subDstTW * sizeof(data_T);
+    static_assert(subSrcBytes + 2u * subDstBytes <= 184u * 1024u,
+                  "ND blocked transpose sub-tile must fit in UB");
+
+    using SrcShape = pto::Shape<1, 1, 1, -1, -1>;
+    using SrcStride = pto::Stride<1, 1, 1, SRC_RS, 1>;
+    using DstShape = pto::Shape<1, 1, 1, -1, -1>;
+    using DstStride = pto::Stride<1, 1, 1, DST_RS, 1>;
+    using SrcGlobal = GlobalTensor<data_T, SrcShape, SrcStride>;
+    using DstGlobal = GlobalTensor<data_T, DstShape, DstStride>;
+
+    using SrcTile = Tile<TileType::Vec, data_T, BR, subSrcTW, BLayout::RowMajor, -1, -1>;
+    using DstTile = Tile<TileType::Vec, data_T, BC, subDstTW, BLayout::RowMajor, -1, -1>;
+    using TmpTile = Tile<TileType::Vec, data_T, BC, subDstTW, BLayout::RowMajor, -1, -1>;
+
+    SrcTile srcTile(BR, BC);
+    DstTile dstTile(BC, BR);
+    TmpTile tmpTile(BC, subDstTW);
+    TASSIGN(srcTile, 0);
+    TASSIGN(dstTile, subSrcBytes);
+    TASSIGN(tmpTile, subSrcBytes + subDstBytes);
+
+    srcTile.SetValidRow(rb);
+    srcTile.SetValidCol(cb);
+    dstTile.SetValidRow(cb);
+    dstTile.SetValidCol(rb);
+
+    SrcGlobal srcGlobal(const_cast<__gm__ data_T*>(src), SrcShape(rb, cb));
+    DstGlobal dstGlobal(dst, DstShape(cb, rb));
+
+    TLOAD(srcTile, srcGlobal);
+
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);   // RAW: transpose waits its load
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
+    TTRANS(dstTile, srcTile, tmpTile);
+
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);   // RAW: store waits the transpose
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+
+    TSTORE(dstGlobal, dstTile);
+    pipe_barrier(PIPE_ALL);  // drain before this lane reuses the UB for its next sub-block
+}
+
 // Case (b): batched 2D transpose. The trailing two output axes (A = to_shape[-2],
 // Bb = to_shape[-1]) form the transpose; all leading axes are batch. For each
 // batch the source block is [Bb, A] with row stride perm_strides[-1] and unit col
 // stride (the second-innermost axis is source-contiguous), transposed into the
-// contiguous [A, Bb] dst slot. Batches are distributed across lanes.
-template <typename data_T, typename CONFIG_T, unsigned PAD_INNER = 0, unsigned PAD_STRIDE = 0>
+// [A, Bb] dst slot. Batches are distributed across lanes.
+//
+// Contract padding (K!=C) on a transposed input is expressed by two orthogonal
+// destination knobs, depending on which output axis is the contract dim:
+//   - input0 (contract = innermost Bb): PAD_INNER=C / PAD_STRIDE=K widen each
+//     transposed row's stride Bb -> K (DST_RS), so the per-batch block is A*K.
+//   - input1 (contract = second-innermost A=rows): DST_BLOCK overrides the
+//     per-batch dst block from A*Bb -> K*Bb, landing each batch's A valid rows at
+//     the front of its K-row slot (innermost Bb=L1 is not padded, DST_RS stays Bb).
+// The pad regions are pre-zeroed by the caller; TSTORE writes only the [A,Bb]
+// valid window, so they hold across calls (§2.1 invariant). DST_BLOCK==0 ⇒ default.
+//
+// Each per-batch [Bb, A] block is transposed whole when it fits UB (one TTRANS per
+// batch, batches distributed across lanes). When it does not, the block is tiled
+// into BR x BC sub-blocks and the (batch, sub-block) grid is flattened into a 1D
+// work space distributed across lanes -- so a single large per-batch transpose uses
+// the whole vector engine instead of one lane (mirrors the 2D blocked path).
+template <typename data_T, typename CONFIG_T, unsigned PAD_INNER = 0,
+          unsigned PAD_STRIDE = 0, unsigned DST_BLOCK = 0>
 AICORE inline void transpose_nd_batched_2d_inline(__gm__ const data_T* src, __gm__ data_T* dst,
                                                   unsigned lane, unsigned nlanes) {
     constexpr unsigned dims = CONFIG_T::dims;
@@ -478,26 +570,70 @@ AICORE inline void transpose_nd_batched_2d_inline(__gm__ const data_T* src, __gm
     constexpr unsigned srcRowStride = CONFIG_T::perm_strides[dims - 1];
     constexpr unsigned srcColStride = CONFIG_T::perm_strides[dims - 2];
     static_assert(srcColStride == 1,
-                  "ND batched transpose (Phase 1): second-innermost output axis must be "
+                  "ND batched transpose: second-innermost output axis must be "
                   "source-contiguous");
-    static_assert(PAD_STRIDE <= PAD_INNER || PAD_STRIDE == 0,
-                  "ND batched transpose (Phase 1): contract padding (K!=C) on a transposed "
-                  "input is not yet supported");
-    constexpr unsigned block = A * Bb;
+    // Innermost-axis (input0 contract) padding: widen each transposed row's stride.
+    constexpr bool PAD = (PAD_STRIDE > PAD_INNER);
+    static_assert(!PAD || Bb == PAD_INNER,
+                  "ND batched transpose: a padded innermost axis must be the contract dim");
+    constexpr unsigned dstRS = PAD ? PAD_STRIDE : Bb;        // transposed-row stride in dst
+    constexpr unsigned block = A * Bb;                       // source / N-decode geometry (unpadded)
+    constexpr unsigned dblock = DST_BLOCK ? DST_BLOCK : A * dstRS;  // per-batch dst block
     constexpr unsigned nbatch = CONFIG_T::N / block;
 
-    unsigned chunk = (nbatch + nlanes - 1) / nlanes;
-    unsigned b0 = lane * chunk;
-    unsigned b1 = (b0 + chunk) < nbatch ? (b0 + chunk) : nbatch;
+    // Does a whole per-batch [Bb, A] block (src + dst + tmp UB tiles) fit UB?
+    constexpr unsigned blk = 32u / sizeof(data_T);
+    constexpr unsigned blockBytes =
+        (Bb * align_up(A, blk) + 2u * A * align_up(Bb, 16u)) * sizeof(data_T);
+    constexpr bool FITS = blockBytes <= 184u * 1024u;
 
-    for (unsigned b = b0; b < b1; b++) {
-        unsigned rem = b, src_base = 0;
-        for (int k = int(dims) - 3; k >= 0; k--) {
-            unsigned e = CONFIG_T::to_shape[k];
-            src_base += (rem % e) * CONFIG_T::perm_strides[k];
-            rem /= e;
+    if constexpr (FITS) {
+        unsigned chunk = (nbatch + nlanes - 1) / nlanes;
+        unsigned b0 = lane * chunk;
+        unsigned b1 = (b0 + chunk) < nbatch ? (b0 + chunk) : nbatch;
+
+        for (unsigned b = b0; b < b1; b++) {
+            unsigned rem = b, src_base = 0;
+            for (int k = int(dims) - 3; k >= 0; k--) {
+                unsigned e = CONFIG_T::to_shape[k];
+                src_base += (rem % e) * CONFIG_T::perm_strides[k];
+                rem /= e;
+            }
+            ttrans_block_inline<data_T, Bb, A, srcRowStride, dstRS>(src + src_base, dst + (size_t)b * dblock);
         }
-        ttrans_block_inline<data_T, Bb, A, srcRowStride, Bb>(src + src_base, dst + (size_t)b * block);
+    } else {
+        // Blocked: tile each [Bb, A] block into BR x BC sub-blocks; flatten
+        // (batch, sub-block) into a 1D work space across lanes. Source sub-block
+        // (r0 over Bb at srcRowStride, c0 over A at unit stride); its [cb, rb]
+        // transpose lands at dst row c0 (stride dstRS), col r0.
+        constexpr unsigned BR = 64;
+        constexpr unsigned BC = 64;
+        constexpr unsigned nBR = (Bb + BR - 1) / BR;
+        constexpr unsigned nBC = (A + BC - 1) / BC;
+        constexpr unsigned bpb = nBR * nBC;            // sub-blocks per batch
+        constexpr unsigned totalWork = nbatch * bpb;
+
+        unsigned chunk = (totalWork + nlanes - 1) / nlanes;
+        unsigned w0 = lane * chunk;
+        unsigned w1 = (w0 + chunk) < totalWork ? (w0 + chunk) : totalWork;
+
+        for (unsigned w = w0; w < w1; w++) {
+            unsigned b = w / bpb;
+            unsigned sb = w - b * bpb;
+            unsigned rem = b, src_base = 0;
+            for (int k = int(dims) - 3; k >= 0; k--) {
+                unsigned e = CONFIG_T::to_shape[k];
+                src_base += (rem % e) * CONFIG_T::perm_strides[k];
+                rem /= e;
+            }
+            unsigned r0 = (sb / nBC) * BR;             // along Bb (source rows)
+            unsigned c0 = (sb % nBC) * BC;             // along A  (source cols)
+            unsigned rb = (Bb - r0) < BR ? (Bb - r0) : BR;
+            unsigned cb = (A - c0) < BC ? (A - c0) : BC;
+            ttrans_block_dyn_inline<data_T, BR, BC, srcRowStride, dstRS>(
+                src + src_base + (size_t)r0 * srcRowStride + c0,
+                dst + (size_t)b * dblock + (size_t)c0 * dstRS + r0, rb, cb);
+        }
     }
 }
 
@@ -1064,6 +1200,30 @@ AICORE inline void transpose_inline(__gm__ const data_T* data, __gm__ data_T* re
     }
 }
 
+// input1 marshalling for K!=C with batching (I>1) and a *non-identity* permutation.
+// input1's matmul layout is [batch.., C, L1]; the contract C is the second-innermost
+// (row) axis, so padding lands each batch's ROWS(=C) valid rows at the front of its
+// PAD_ROWS(=K)-row slot (per-batch dst block PAD_ROWS*INNER, the tail rows pre-zeroed)
+// -- the row-pad analogue of transpose_inline's innermost-pad. Identity input1 is the
+// simple contiguous repack and is handled by the caller (batched_pad_copy_inline);
+// only the two non-identity N-D shapes reach here.
+template <typename data_T, typename CONFIG_T, unsigned ROWS, unsigned PAD_ROWS, unsigned INNER>
+AICORE inline void transpose_inline_rowpad(__gm__ const data_T* data, __gm__ data_T* res,
+                                           unsigned lane, unsigned nlanes) {
+    static_assert(CONFIG_T::dims >= 3,
+                  "input1 row-pad transpose: batching (I>1) implies a >=3D operand");
+    constexpr unsigned PAD_BATCH = PAD_ROWS * INNER;   // K*L1 per-batch dst block
+    if constexpr (CONFIG_T::perm[CONFIG_T::dims - 1] == CONFIG_T::dims - 1) {
+        // innermost (L1) preserved -> strided gather; pad each batch's C rows into
+        // its K-row slot via the (ROWS, PAD_BATCH) knob (innermost L1 unpadded).
+        transpose_nd_copy_inline<data_T, CONFIG_T, 0, 0, ROWS, PAD_BATCH>(data, res, lane, nlanes);
+    } else {
+        // innermost changes -> batched 2D TTRANS; the trailing axes are [C, L1], so
+        // override the per-batch dst block C*L1 -> K*L1 (DST_BLOCK); L1 stays unpadded.
+        transpose_nd_batched_2d_inline<data_T, CONFIG_T, 0, 0, PAD_BATCH>(data, res, lane, nlanes);
+    }
+}
+
 template <typename data_T, typename CONFIG_T>
 __global__ AICORE void transpose_kernel_standalone(__gm__ const data_T* data, __gm__ data_T* res) {
     if constexpr (DAV_VEC) {
@@ -1276,13 +1436,17 @@ __global__ AICORE void einsum_fused_kernel(
         // batch, the K-C tail sits after the (one) valid block, so a plain
         // transpose into the pre-zeroed ws1 suffices. For K!=C with batching, each
         // batch's C valid rows must land at the front of its K-row slot (stride
-        // K*L1) — a contiguous write would mis-stride the batches — so repack with
-        // a per-batch K-row pad. SKIP1: ws1 == data1, read data1 directly.
+        // K*L1) — a contiguous write would mis-stride the batches. An identity input1
+        // is the contiguous repack (batched_pad_copy_inline); a non-identity input1
+        // transposes *and* row-pads (transpose_inline_rowpad). SKIP1: ws1 == data1.
         if constexpr (!SKIP1) {
             if constexpr (K != C && I > 1) {
-                static_assert(IsIdentityPerm<typename CONFIG_T::tpose_inp1_config>::value,
-                              "Batched K!=C fusion assumes an identity input1 permutation.");
-                batched_pad_copy_inline<data_T>(data1, ws1, I, C, L1, K * L1, lane, nlanes);
+                if constexpr (IsIdentityPerm<typename CONFIG_T::tpose_inp1_config>::value) {
+                    batched_pad_copy_inline<data_T>(data1, ws1, I, C, L1, K * L1, lane, nlanes);
+                } else {
+                    transpose_inline_rowpad<data_T, typename CONFIG_T::tpose_inp1_config, C, K, L1>(
+                        data1, ws1, lane, nlanes);
+                }
             } else {
                 transpose_inline<data_T, typename CONFIG_T::tpose_inp1_config>(data1, ws1, lane, nlanes);
             }

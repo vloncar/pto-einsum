@@ -31,13 +31,39 @@ from pto_einsum import einsum, EinsumBuilder
     ("bij, bjk -> bik", (8, 16, 20), (8, 20, 64)),
     # multi-batch-axis contractions (two inplace axes, e.g. batch + heads): the
     # operands need an N-D non-identity transpose into the [batch, free, contract]
-    # matmul layout. Exercises both Phase-1 N-D transpose paths -- innermost-
+    # matmul layout. Exercises both N-D transpose paths -- innermost-
     # preserved strided gather (inputs/output whose inner axis is unchanged) and
     # the batched 2D TTRANS (an input whose inner axis moves) -- plus a non-
     # identity *output* permutation. d=64 keeps it exact in fp16 too.
     ("bshd, bthd -> bsht", (4, 16, 8, 64), (4, 16, 8, 64)),  # attention scores
     ("bsht, bthd -> bshd", (4, 16, 8, 16), (4, 16, 8, 64)),  # attention context
     ("bshd, hdk -> bshk", (4, 16, 8, 64), (8, 64, 64)),      # per-head rotation
+    # Non-16-aligned contraction (K != C) on an N-D *transposed* input.
+    # Part A: in `bhs` the contract `h` is not the innermost source axis, so input0
+    # takes the batched-2D TTRANS path, whose innermost output axis IS the contract
+    # dim -- now padded h=20 -> K=32. Single-batch (b=1, I=1) and multi-batch (I=b>1)
+    # both exercise the K-padded transposed-row stride. (input1 `bht` stays identity.)
+    ("bhs, bht -> bst", (1, 20, 16), (1, 20, 24)),  # input0 batched-2D K!=C, I=1
+    ("bhs, bht -> bst", (4, 20, 16), (4, 20, 24)),  # input0 batched-2D K!=C, I>1
+    # Part B: K != C with a *non-identity* input1 and batching (I = b*h > 1). input1's
+    # matmul layout is [batch, C, L1]; the contract C is the row axis, so each batch's
+    # C valid rows must land at the front of its K-row slot (transpose_inline_rowpad).
+    # `bcht`: t (L1) stays innermost -> case (a) row-padded gather; `bhtc`: c (C) is
+    # innermost so the inner axis moves -> case (b) batched-2D TTRANS with a K-padded
+    # per-batch block. c=20 -> K=32. (input0 `bhsc` is identity + K!=C padded copy.)
+    ("bhsc, bcht -> bsht", (2, 8, 16, 20), (2, 20, 8, 24)),  # input1 case (a), K!=C, I>1
+    ("bhsc, bhtc -> bhst", (2, 8, 16, 20), (2, 8, 24, 20)),  # input1 case (b), K!=C, I>1
+    # Large per-batch transpose tile (exceeds UB): the batched-2D TTRANS
+    # block is tiled into 64x64 sub-blocks distributed across the vector lanes. The
+    # `bhs` per-batch block is [h, s]; h=128/130, s=256 push it past the 184 KB UB so
+    # it must block. h=128 -> K==C (no pad); h=130 -> K=144 exercises blocking *with*
+    # the input0 innermost contract pad. The input1 case-(b) variant (c=130, t=256)
+    # blocks the [t, c] tile *with* the input1 K-row pad. The matmul-facing free/
+    # contract dims (s/t=256, h/c=128|130) keep the padded M/N/K tile-divisible (the
+    # partial-tile constraint is a separate roadmap item). fp16 keeps tol at 1e-2.
+    ("bhs, bht -> bst", (2, 128, 256), (2, 128, 64)),        # input0 blocked, K==C
+    ("bhs, bht -> bst", (2, 130, 256), (2, 130, 64)),        # input0 blocked + pad
+    ("bhsc, bhtc -> bhst", (2, 4, 16, 130), (2, 4, 256, 130)),  # input1 case (b) blocked + pad
     # elementwise (Hadamard) multiply: no contracted index, identical index order on
     # both inputs and the output. Routed to the dedicated elementwise kernel instead
     # of a batch of degenerate 1x1x1 matmuls. Sizes chosen to exercise the streaming

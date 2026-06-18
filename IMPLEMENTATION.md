@@ -147,7 +147,11 @@ implementation (`transpose_2d_inline`) has two structural cases:
   whole vector engine, not a single core. The per-block GM rows start at
   `r·srcCols` / `c·srcRows`, so this path requires 16-aligned dims to keep
   every transfer 32-byte aligned (a **GM-DMA** constraint, not a `TTRANS` one; a
-  `static_assert` enforces it; unaligned-large is not yet supported).
+  `static_assert` enforces it; unaligned-large is not yet supported). Boundary
+  blocks are partial (`< BR/BC`); each `TLOAD`/`TSTORE` therefore carries a
+  **DYNAMIC GM window of the real `rb/cb`** dims, not the padded `BR×BC` — a static
+  window over-reads the source and over-writes the neighbouring output block (a
+  latent bug masked while every blocked test used 64-multiple dims).
 
 So the cases are: (1) any tensor that fits UB → fully general hardware transpose;
 (2) large 16-aligned tensors → blocked hardware transpose; (3) large *unaligned*
@@ -179,10 +183,39 @@ only the source side carries the permutation.
   (`ttrans_block_inline`, the 2D fits-UB body parameterised by strides). Batches
   are distributed across the Vec lanes.
 
-Phase 1 covers `K==C` (the contraction already 16-aligned, the common case for
-attention where `head_dim` is a multiple of 16); the contract-padding interaction
-with a *transposed* input (the batched-`TTRANS` case) and per-batch inner tiles
-too large for UB are left to a later phase (guarded by `static_assert`).
+The contract padding (`K!=C`) is threaded through both N-D paths. The contract
+dim sits at a different axis for the two operands, so each pads a different
+destination stride:
+
+- **input0** (`[batch.., L0, C]`, contract = innermost): the batched-`TTRANS` path
+  widens each transposed row's stride `C→K` (`PAD_INNER`/`PAD_STRIDE` → `DST_RS`),
+  matching the gather/2D paths' `DST_PAD`.
+- **input1** (`[batch.., C, L1]`, contract = second-innermost row count): a
+  non-identity input1 is transposed *and* row-padded by `transpose_inline_rowpad`,
+  which lands each batch's `C` valid rows at the front of its `K`-row slot —
+  per-batch dst block `C·L1 → K·L1` (the gather's `(ROWS, PAD_BATCH)` knob for the
+  innermost-preserved case, `transpose_nd_batched_2d_inline`'s `DST_BLOCK` override
+  for the innermost-changes case). An *identity* input1 stays the contiguous
+  `batched_pad_copy_inline` repack.
+
+The pad regions are pre-zeroed once and the transposes write only the valid window,
+so the padding holds across calls (the §2.1 persistent-workspace invariant).
+
+A per-batch `[Bb, A]` block is transposed whole when it fits UB; when it does not,
+it is tiled into `BR×BC` sub-blocks and the `(batch, sub-block)` grid is flattened
+into a 1D work space across the Vec lanes (so one large per-batch transpose uses the
+whole vector engine, like the 2D blocked path). Boundary sub-blocks are partial, so
+each `TLOAD`/`TSTORE` carries a **DYNAMIC GM window set to the real `rb/cb`** dims
+(`ttrans_block_dyn_inline`) — a static `BR×BC` window would over-read the source and
+over-write neighbouring output (the same "GM windows carry real dims" rule the
+matmul follows; the 2D blocked path was fixed the same way, it had a latent
+partial-block bug masked by only-64-multiple tests).
+
+Still guarded by `static_assert`: the `srcColStride==1` requirement that the
+second-innermost output axis be source-contiguous in the batched-`TTRANS` case.
+Lifting it needs a non-contiguous gather (the GM DMA has no strided-inner mode), a
+separate mechanism that overlaps the broadcast-op roadmap item — not part of the
+`K!=C` / large-tile scope.
 
 ### Phase B — Cube-core tiled matmul
 
@@ -446,7 +479,12 @@ stale `.so` is reused and the change appears to have no effect.
 
 ## Roadmap
 
+- Lift the N-D batched-`TTRANS` `srcColStride==1` requirement (source whose
+  second-innermost output axis is non-contiguous) — needs a non-contiguous gather,
+  not a single strided DMA; shares its mechanism with the broadcast-op item below.
 - Support partial tiles (problem dims not divisible by the tile size), removing
   the matmul divisibility constraint.
 - Support unaligned large 2D transposes, removing the blocked-transpose 16-aligned
   constraint.
+- Pure broadcast / scaling ops (`bsd,d->bsd`, `rms_norm`, `rope`) — empty
+  contraction, a Vector-only broadcast-multiply path, not a matmul.

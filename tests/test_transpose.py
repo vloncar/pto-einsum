@@ -136,6 +136,14 @@ TRANSPOSE_CASES = [
     ((256, 128), (1, 0), torch.float32),
     ((128, 256), (1, 0), torch.float16),
     ((512, 64), (1, 0), torch.float32),
+    # 3b. Blocked TTRANS with *partial* boundary sub-blocks: 16-aligned but not a
+    #     64-multiple, so the last block row/col is < BR/BC. The GM window must carry
+    #     the real (rb/cb) dims or it over-reads/over-writes neighbours. Covers a row
+    #     partial, a col partial, both, and fp16.
+    ((80, 256), (1, 0), torch.float32),
+    ((256, 80), (1, 0), torch.float32),
+    ((144, 144), (1, 0), torch.float32),
+    ((144, 208), (1, 0), torch.float16),
 ]
 
 
