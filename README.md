@@ -26,18 +26,18 @@ c = einsum("ij, jk -> ik", a, b)        # runs on the NPU, returns an NPU tensor
 - Dtypes: `float32` and `float16` (NPU); `float32` on the CPU reference path.
 - **Tiling**: the Cube matmul and the 2D transpose are tiled so problems no longer
   need to fit entirely on-chip. The matmul tile size is configurable
-  (`EINSUM_TILE_SIZE`, default 128); the (fractal-padded) problem dims must divide
-  evenly by the tile size (arbitrary tails are not yet supported). The matmul
-  K-loop is double-buffered.
+  (`EINSUM_TILE_SIZE`, default 128); output dims are arbitrary — a boundary tile
+  pads its operand up to a whole tile (zero-filled) and clamps the store to the real
+  dim. The matmul K-loop is double-buffered.
 - **2D transpose** uses the `TTRANS` hardware tile op (`vnchwconv`) rather than a
-  scalar element copy — a large speedup on transposing equations. It is general
-  for `float32`/`float16`; large *unaligned* 2D transposes are not yet supported.
+  scalar element copy — a large speedup on transposing equations. It is general for
+  `float32`/`float16`, including large and *unaligned* (non-16-multiple) tensors.
   The blocked (large-tensor) transpose is distributed across all Vector cores.
 - **Multi-batch-axis contractions.** Equations with two or more batch axes (batch
   + heads, e.g. attention `bshd, bthd -> bsht`) need an N-D non-identity transpose
   into the canonical `[batch, free, contract]` layout. These are handled by a
   strided gather (when the innermost axis is preserved) or a batched 2D `TTRANS`
-  (when it moves), for the 16-aligned-contraction (`K==C`) case.
+  (when it moves), for both `K==C` and non-16-aligned `K!=C` contractions.
 - **Elementwise (Hadamard) products.** An einsum with no contracted index and the
   same index order on both inputs and the output (e.g. `ts, ts -> ts` — the decay/
   mask step of linear attention `einsum("tn,sn,sp,ts->tp", …)` written as three
@@ -46,6 +46,11 @@ c = einsum("ij, jk -> ik", a, b)        # runs on the NPU, returns an NPU tensor
   batch of degenerate 1×1×1 matmuls. Output is `float32`; `float16` inputs are
   up-cast and multiplied in float. Any `N` is handled directly — each block carries
   a dynamic valid extent so the short tail needs no padding or size floor.
+- **Broadcast / scaling products.** An einsum with no contracted index where one
+  operand carries every output axis and the other a strict subset (e.g. `bsd, d ->
+  bsd` rms-norm scaling, `bshd, sd -> bshd` RoPE, `hqk, h -> hqk` ALiBi) is a pure
+  broadcast multiply, routed to a dedicated Vector kernel (hardware column-expand or
+  scalar multiply) rather than a matmul. NPU only; output is `float32`.
 - **Single fused kernel.** The transpose → matmul → transpose pipeline runs in one
   mix-kernel launch (Cube + Vector cores cooperating, full cross-core barriers via
   FFTS) instead of four separate launches — removing launch overhead and host
@@ -139,8 +144,16 @@ pto-einsum/
 │   └── include/
 │       ├── pto_einsum.h   # NPU kernels (transpose + tiled Cube matmul)
 │       └── cpu_einsum.h   # CPU reference kernels
-├── tests/                 # pytest suites (einsum, split, transpose, python ref)
-├── benchmarks/            # bench_einsum.py, bench_llm_contractions.py, debug_einsum.py
+├── tests/
+│   ├── reference.py       # pure-Python transpose + matmul reference (helper)
+│   ├── test_transpose.py  # component: standalone transpose kernel
+│   ├── test_matmul.py     # component: standalone transpose + Cube matmul vs reference
+│   ├── test_einsum.py     # base: general einsum correctness + builder/validation/cleanup
+│   └── test_llm_ops.py    # LLM: attention contractions, linear attention, broadcast/scaling
+├── benchmarks/
+│   ├── base/              # generic einsum primitives (bench_einsum.py, bench_transpose.py)
+│   ├── complex/           # LLM workloads (bench_llm_contractions.py, bench_linear_attention.py)
+│   └── bench_results/     # generated plots
 ├── IMPLEMENTATION.md      # kernel design notes
 ├── pyproject.toml / setup.cfg / setup.py
 └── requirements.txt
@@ -150,40 +163,56 @@ pto-einsum/
 
 ```bash
 export PTO_LIB_PATH=/path/to/pto-isa
-pytest tests/test_einsum.py tests/test_split_npu.py
-python tests/test_transpose_npu.py
+pytest tests/                       # whole suite
 ```
+
+The suite is split by scope:
+
+- `test_transpose.py` / `test_matmul.py` — **components**: the standalone transpose
+  and Cube-matmul kernels, checked against the pure-Python reference (`reference.py`).
+- `test_einsum.py` — **base**: general end-to-end einsum correctness, with cases
+  grouped by the kernel path they exercise (identity/transposed/blocked layouts,
+  non-identity output, batched, `K!=C`, elementwise, degenerate free dims, split-K,
+  partial tiles), plus builder reuse, input validation and cleanup. Known-unsupported
+  equations are kept as `skip`s (with their loud-failure contract pinned) so they
+  flip to real checks once a path lands.
+- `test_llm_ops.py` — **LLM**: multi-batch-axis attention contractions, the
+  linear-attention chain, and broadcast/scaling ops.
 
 Verify across tile sizes, e.g. `EINSUM_TILE_SIZE=32 pytest tests/test_einsum.py`.
 
 ## Benchmark
 
+Benchmarks compare the custom kernels against `torch.einsum` on the NPU and are
+grouped into `base/` (generic einsum primitives) and `complex/` (realistic LLM
+workloads). All plots are written to `benchmarks/bench_results/`.
+
+**Base — primitive einsum patterns swept over tensor sizes:**
+
 ```bash
 export PTO_LIB_PATH=/path/to/pto-isa
-python benchmarks/bench_einsum.py             # all benchmarks
-python benchmarks/bench_einsum.py matmul      # a single benchmark
+python benchmarks/base/bench_einsum.py            # all primitive benchmarks
+python benchmarks/base/bench_einsum.py matmul     # a single benchmark
+python benchmarks/base/bench_transpose.py         # 2D-transpose micro-benchmark
 ```
 
-Compares the custom kernels against `torch.einsum` on the NPU. Each benchmark is
-an einsum pattern swept over a range of tensor sizes (for scaling behaviour).
-With no argument all benchmarks run; pass a benchmark name to run just one
-(`matmul`, `matmul-fp16`, `transpose`, `outer`, `dot-product`, `batch-matmul`,
-`contraction`, `custom-layout`, `unaligned`, `batch-unaligned`). Plots are
-written to `benchmarks/bench_results/`: one image per benchmark plus a
-`summary.png` showing each pattern's mean speedup with its min/max range.
+`bench_einsum.py` runs with no argument for the whole sweep, or pass a benchmark
+name to run just one (`matmul`, `matmul-fp16`, `transpose`, `outer`, `dot-product`,
+`batch-matmul`, `contraction`, `custom-layout`, `unaligned`, `batch-unaligned`); it
+emits one image per benchmark plus a `summary.png` of each pattern's mean speedup
+with its min/max range.
 
-A second script benchmarks realistic LLM contraction patterns (attention,
-SwiGLU, LoRA, MoE, RoPE, logits, …) against `torch.einsum`:
+**Complex — realistic LLM workloads:**
 
 ```bash
-python benchmarks/bench_llm_contractions.py
+python benchmarks/complex/bench_llm_contractions.py   # attention, SwiGLU, LoRA, MoE, RoPE, …
+python benchmarks/complex/bench_linear_attention.py   # the 4-way linear-attention chain
 ```
 
-Each pattern is written once as an einsum expression and run with both
-`torch.einsum` and the custom kernel, reporting correctness (relative diff) and
-per-pattern timing. Patterns the kernel does not yet cover (e.g. contractions
-needing a non-identity transpose of a >2D operand, or pure broadcast/scaling
-ops) are listed as `unsupported` with the reason.
+`bench_llm_contractions.py` writes each pattern once as an einsum expression and runs
+it with both `torch.einsum` and the custom kernel, reporting correctness (relative
+diff) and per-pattern timing. Patterns the kernel does not cover are listed as
+`unsupported` with the reason.
 
 > **Note:** the JIT build cache keys only on the generated `.cpp` (config), not on
 > the bundled headers. If you edit `src/pto_einsum/include/*.h`, delete the build

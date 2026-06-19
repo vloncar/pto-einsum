@@ -650,8 +650,9 @@ AICORE inline void transpose_nd_batched_2d_inline(__gm__ const data_T* src, __gm
 // Fractal alignment: the on-chip Mat/Left/Right/Acc tiles need multiples of 16
 // (NZ Mat InnerRows==16; Acc fractalCSize InnerRows==InnerCols==16). 16 is a
 // multiple of the C0 block (fp32=8, fp16=16), so InnerCols==C0 holds too. Tile
-// sizes are min(config, padded-dim), and the padded dim must divide evenly (no
-// partial tiles).
+// sizes are min(config, padded-dim); a boundary tile whose padded dim is not a
+// whole tile multiple is handled by padding the operand buffer up to a whole tile
+// (Ma rows / Na cols, zero-filled — see MatmulGeom), so every loaded tile is full.
 //
 // The contraction loads full-Kt-wide (valid col == Kt): the caller guarantees the
 // GM A/B buffers are K-wide and zero-padded, so every Kt step has a full (>=C0)
@@ -1305,7 +1306,7 @@ void transpose(const data_T* data, data_T* res, void* stream = nullptr) {
 // "small/partial-tile fp16 quirk" (it is not — bare TCVT is correct at every size). The
 // barrier lets blocks carry a dynamic valid extent, so the tail is just a short block
 // (no full-valid / backward-overlap dance, no minimum size). fp32 has no TCVT and so no
-// intra-V hazard. See pto-einsum/bug_report/FINDINGS.md for the isolating reproducer.
+// intra-V hazard.
 
 // One block at `base`, covering `valid` (<= CAP) elements. CAP is the static tile
 // capacity; `valid` is the dynamic transfer/compute extent (a short tail uses valid<CAP).

@@ -1,8 +1,13 @@
+"""Pure-Python einsum reference (transpose + batched matmul).
+
+These are the golden building blocks the standalone-kernel component test
+(test_matmul.py) validates the NPU transpose / Cube matmul against. This module is
+a helper, not a pytest suite -- run it directly (`python tests/reference.py`) for a
+quick CPU self-check that the reference itself matches torch.einsum.
+"""
 import numpy as np
 import torch
-import os
 
-TEST_DEVICE = os.getenv('EINSUM_TEST_DEVICE', 'npu')
 
 def transfer_idx(index, to_shape, perm_strides):
     idx = 0
@@ -34,7 +39,7 @@ def batched_matmul(tpose_i0, tpose_i1, I, L0, L1, C):
                 res[(i * L0 + l0) * L1 + l1] = acc
     return res
 
-def test_split_einsum():
+def _self_check():
     # Test case: ij, jk -> ik
     # shapes: (32, 64), (64, 128)
     # output: (32, 128)
@@ -73,4 +78,4 @@ def test_split_einsum():
     print("Test passed successfully!")
 
 if __name__ == '__main__':
-    test_split_einsum()
+    _self_check()

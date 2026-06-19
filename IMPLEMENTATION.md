@@ -304,8 +304,7 @@ the Vector pipe. A `pipe_barrier(PIPE_V)` between the converts and the multiply 
 required; without it the `TMUL` can read pre-convert data. On a large tile the
 multi-repeat `TCVT` latency hides the window, which is why this once looked like a
 "small/partial-tile fp16 hardware quirk" — it is not. Bare `TCVT` is correct at every
-size; an isolating reproducer (single op, properly synced) is in
-`bug_report/FINDINGS.md`. fp32 has no `TCVT`, so no intra-`V` hazard.
+size. fp32 has no `TCVT`, so no intra-`V` hazard.
 
 ## 1.4 Broadcast / scaling path (`broadcast_mul`)
 
@@ -384,7 +383,7 @@ non-reusing callers.
 Part 1 §Phase B requires a `K`-wide, zero-padded A and `K`-row, zero-padded B. The
 naive way to get them is a host-side `malloc`/`memcpy2d`/stream-sync between
 transpose and matmul (this is what the standalone `batched_matmul` host function
-still does — kept as a reference path, exercised by `test_split_npu.py`). The fused
+still does — kept as a reference path, exercised by `test_matmul.py`). The fused
 kernel instead allocates `ws0`/`ws1` K-padded, zeroes them once (§2.1), and the
 **input transposes write the padded layout directly**:
 
@@ -542,23 +541,20 @@ stale `.so` is reused and the change appears to have no effect.
 
 - Lift the N-D batched-`TTRANS` `srcColStride==1` requirement (source whose
   second-innermost output axis is non-contiguous) — needs a non-contiguous gather,
-  not a single strided DMA; shares its mechanism with the broadcast-op item below.
-- **Done:** partial matmul tiles (output dim not a multiple of the tile) — the
-  operand buffer is padded up to a whole tile (`Ma` rows / `Na` cols, zero-filled)
-  so every tile loads full; the store clamps to the real dim. Output dims are now
-  arbitrary. Currently single-batch (`I==1`) only — a batched partial config needs
-  the per-batch row/col block padded, rejected with a `ValueError` for now.
-- **Done:** unaligned *large* 2D transposes. The blocked-transpose 16-aligned
-  `static_assert` was conservative — the block base is always 32-byte aligned and
-  the GM↔UB transfers are element-granular ND copies, so the dynamic per-block
-  window already handles arbitrary (non-16-aligned, odd) dims. Dropping the assert
-  unblocks *arbitrary* large linear-attention sequence lengths: the QKᵀ input
-  transpose for e.g. `seqlen=1000` now works end-to-end (chain correctness `yes`,
-  fp32 + fp16).
-- **Done:** pure broadcast / scaling ops (`bsd,d->bsd` rms_norm, `bsd,sd->bsd`
-  token_pos, `bshd,sd->bshd` rope, `hqk,h->hqk` alibi) — empty contraction, a
-  Vector-only broadcast-multiply path (`broadcast_mul`, §1.4), not a matmul. Both
-  modes (column-expand and scalar) and the interior-strided (rope) case are covered,
-  fp32 + fp16. Remaining limit: an inner present-axis run larger than `BCAST_TILECAP`
-  (e.g. token_pos at `d=512` → `Cc=8192`) still falls through to the matmul path —
-  in-kernel column blocking of the `[rb × Cc]` tile would lift it.
+  not a single strided DMA.
+- Batched partial matmul tiles. Partial M/N tiles (a free dim not a multiple of the
+  tile) are supported for single-batch (`I==1`) only; a batched partial config needs
+  the per-batch row/col block padded and is currently rejected with a `ValueError`.
+- Broadcast/scaling ops with an inner present-axis run larger than `BCAST_TILECAP`
+  (e.g. token_pos at `d=512` → `Cc=8192`) fall through to the matmul path — in-kernel
+  column blocking of the `[rb × Cc]` tile (§1.4) would lift it.
+- Single-operand reduction axes — an index in exactly one operand and not in the
+  output (e.g. `ij,jk->k`, where torch sums `i`). The transpose→matmul pipeline has
+  no reduce stage, so `parse_recipe` rejects these with a clean `ValueError` today
+  (it previously dropped the axis and miscomputed silently). **Option A (in-pipeline
+  Vector reduction):** detect the solo axes in `parse_recipe`, reorder them outermost
+  on the owning operand, and add a Vector reduce-sum stage that collapses them into a
+  workspace before Phase A — mirroring the elementwise/broadcast kernels (new codegen,
+  an FFTS barrier, workspace sizing, dispatch plumbing). The reduced operand then
+  feeds the existing transpose→matmul→transpose pipeline unchanged. Keeps the op fused
+  and on-device.

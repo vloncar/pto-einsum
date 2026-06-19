@@ -1,3 +1,11 @@
+"""Component test: the standalone NPU kernels (Vector transpose + Cube matmul).
+
+Runs the split building blocks of the einsum pipeline -- each input transpose, the
+batched Cube matmul, and the output transpose -- as separate kernel launches and
+checks every stage against the pure-Python reference (reference.py). This isolates
+the transpose and multiplication components from the fused end-to-end path that
+test_einsum.py exercises.
+"""
 import numpy as np
 import torch
 import torch_npu
@@ -7,11 +15,11 @@ import os
 
 TEST_DEVICE = os.getenv('EINSUM_TEST_DEVICE', 'npu')
 
-# test_python_einsum is a sibling helper module in this tests/ directory.
+# reference.py is a sibling helper module in this tests/ directory.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pto_einsum import EinsumBuilder
-from test_python_einsum import transpose as py_transpose, batched_matmul as py_batched_matmul
+from reference import transpose as py_transpose, batched_matmul as py_batched_matmul
 
 def test_npu_split_einsum():
     if TEST_DEVICE == 'cpu':

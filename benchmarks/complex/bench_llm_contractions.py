@@ -20,7 +20,7 @@ head-merge projection, GLU gate/value, contrastive similarity) are omitted.
 
 Run on an Ascend NPU host with ``PTO_LIB_PATH`` exported:
 
-    python benchmarks/bench_llm_contractions.py
+    python benchmarks/complex/bench_llm_contractions.py
 """
 
 import re

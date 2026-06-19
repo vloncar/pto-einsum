@@ -12,8 +12,9 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-# Where per-benchmark plots and the summary plot are written.
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bench_results")
+# Where per-benchmark plots and the summary plot are written (benchmarks/bench_results,
+# shared across the base/ and complex/ suites).
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bench_results")
 
 # Timing configuration.
 WARMUP = 5

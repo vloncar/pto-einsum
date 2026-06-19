@@ -40,7 +40,8 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bench_results")
+# benchmarks/bench_results, shared across the base/ and complex/ suites.
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bench_results")
 
 WARMUP = 5
 RUNS = 50

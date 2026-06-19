@@ -159,6 +159,18 @@ class EinsumBuilder:
         _contract = _common - s_out
         _inplace = _common & s_out
 
+        # Single-operand reduction axes: an index that appears in exactly one operand
+        # and not in the output. torch.einsum sums these out, but the transpose->matmul
+        # pipeline has no reduce stage and the axis fits none of the contract/invariant/
+        # inplace buckets below, so it would be silently dropped (wrong result). Reject
+        # it with a clean error until an in-pipeline Vector reduction lands (roadmap:
+        # "Single-operand reduction axes", IMPLEMENTATION.md).
+        _solo = (s_in0 - s_in1 - s_out) | (s_in1 - s_in0 - s_out)
+        if _solo:
+            raise ValueError(
+                f"einsum '{fn}': index {sorted(_solo)} appears in only one operand and "
+                "is reduced away; single-operand reduction is not supported.")
+
         # Pure broadcast / scaling: no contracted index and exactly one operand carries
         # every output axis in output order; the other is a strict subset (broadcast). Route
         # to the Vector broadcast kernel instead of a batch of degenerate 1xC matmuls (which
