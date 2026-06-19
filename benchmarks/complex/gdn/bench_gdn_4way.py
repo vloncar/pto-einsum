@@ -1,9 +1,15 @@
 """4-way GDN benchmark: torch reference vs torch-einsum vs pto-einsum vs megagdn-pto.
 
 For every (N_seq, L_seg) workload it times each of the six GDN stages
-(cumsum, kkt, solve_tril, wy_fast, chunk_h, chunk_o) for all four implementations
-and renders a *grouped stacked bar chart*: stages stack within a bar, the four
-implementations form a group, and each (N_seq, L_seg) workload is one group.
+(cumsum, kkt, solve_tril, wy_fast, chunk_h, chunk_o) for all four implementations.
+The rendered chart is a *grouped stacked bar chart* restricted to the four
+contraction stages (kkt, wy_fast, chunk_h, chunk_o) for the three NPU
+implementations (torch.einsum, pto-einsum, megagdn) — the stages stack within a
+bar, the implementations form a group, and each (N_seq, L_seg) workload is one
+group. The torch-glue stages (cumsum, and the dominant solve_tril) are timed and
+recorded in the JSON but deliberately not plotted: a full-pipeline chart is
+swamped by solve_tril and says nothing about the einsum contraction backend, which
+is what this benchmark exists to compare.
 
   1. torch reference  — RefGDN, naive per-head Python loops, fp32          (ref_gdn.py)
   2. torch einsum     — EinsumGDN, head-vectorised torch.einsum, fp32      (einsum_gdn.py)
@@ -273,18 +279,14 @@ def main():
     print(f"\n[saved {json_path}]")
 
     sub = f"(H={H}, Hg={Hg}, D={D}, C={C})"
-    full = plot(results, configs, IMPLS, STAGES,
-                f"GDN forward — per-stage latency, 4-way  {sub}",
-                out_dir / "gdn_4way_stacked.png")
-    # Companion: only the contraction stages (where the einsum backend matters) for the
-    # three NPU implementations — torch.einsum vs pto-einsum vs megagdn — with the
-    # torch-glue stages (cumsum, the dominant solve_tril) dropped so the comparison the
-    # pto-einsum library actually drives is legible.
+    # Only the contraction stages (where the einsum backend actually matters) for the
+    # three NPU implementations — torch.einsum vs pto-einsum vs megagdn. The torch-glue
+    # stages (cumsum, and especially the dominant solve_tril) are dropped: a full-pipeline
+    # plot is swamped by solve_tril and tells you nothing about the contraction backend.
     contraction = ["kkt", "wy_fast", "chunk_h", "chunk_o"]
     comp = plot(results, configs, ["torch_einsum", "pto_einsum", "megagdn"], contraction,
                 f"GDN contraction stages only (kkt+wy_fast+chunk_h+chunk_o)  {sub}",
                 out_dir / "gdn_4way_contractions.png")
-    print(f"[saved {full}]")
     print(f"[saved {comp}]")
 
 
