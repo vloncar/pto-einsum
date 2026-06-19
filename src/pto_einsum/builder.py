@@ -27,6 +27,13 @@ _NO_BCAST = dict(
     bc_sizeB=1, bc_full_is_in0=True, bc_outer_dims=(), bc_outer_bstride=(),
 )
 
+# Neutral fused-output-permutation fields (non-fusible default). The matmul path
+# overrides these when the output is fusible; elementwise/broadcast never matmul.
+_NO_FUSE = dict(
+    out_fusible=0, out_row_stride=0, out_n_batch=0,
+    out_batch_sizes=(), out_batch_strides=(),
+)
+
 class EinsumRecipe(TypedDict):
     in_transpose_idxs: tuple[tuple[int, ...], tuple[int, ...]]
     L0: int
@@ -60,6 +67,16 @@ class EinsumRecipe(TypedDict):
     bc_full_is_in0: bool # which raw operand is the full (contiguous) one
     bc_outer_dims: tuple      # OUTER axis sizes, outermost first
     bc_outer_bstride: tuple   # broadcast-operand element stride per OUTER axis
+    # Fused output permutation (drop Phase C). Set when free0/free1 are each a single
+    # axis and free1 is the innermost output axis: the Cube stores each tile straight
+    # into res in permuted order. out_row_stride is res's free0 stride; the batch
+    # arrays (inplace-axis sizes + res strides, out-natural order) decode the flat
+    # batch index into a res base. Neutral (out_fusible=0) when not fusible.
+    out_fusible: int
+    out_row_stride: int
+    out_n_batch: int
+    out_batch_sizes: tuple
+    out_batch_strides: tuple
 
 class EinsumBuilder:
     def __init__(self, equation: str, input_shapes: list[tuple[int, ...]], dtype: torch.dtype, device: str = "npu"):
@@ -152,6 +169,7 @@ class EinsumBuilder:
                 elementwise=True,
                 n_elem=prod(out_shape),
                 **_NO_BCAST,
+                **_NO_FUSE,
             )
 
         s_in0, s_in1, s_out = set(in0), set(in1), set(out)
@@ -203,6 +221,34 @@ class EinsumBuilder:
         _out_transpose_idx = np.argsort(tuple(map(out.index, inplace + invariant0 + invariant1)))
         out_transpose_idx = tuple(int(i) for i in _out_transpose_idx)
 
+        # Fused output permutation. When free0 (invariant0) and free1 (invariant1) are
+        # each a single axis and free1 is the innermost output axis (res col stride 1),
+        # the Cube can store each matmul tile straight into res in its permuted position
+        # — dropping Phase C, the second barrier and the ws_res buffer. The batch (inplace)
+        # axes decode the flat batch index `i` into a res base via their res strides; the
+        # free0 axis gives the store row stride. Any other output (multi-axis free dim, or
+        # free1 not innermost) stays non-fusible and keeps the Phase C transpose.
+        out_identity = out_transpose_idx == tuple(range(len(out_transpose_idx)))
+        fusible = (len(invariant0) == 1 and len(invariant1) == 1
+                   and out.index(invariant1[0]) == len(out) - 1
+                   and not out_identity)
+        if fusible:
+            # res (out_shape) row-major element stride per output axis label.
+            res_stride = {}
+            running = 1
+            for ax in reversed(out):
+                res_stride[ax] = running
+                running *= out_shape[out.index(ax)]
+            fuse_fields = dict(
+                out_fusible=1,
+                out_row_stride=int(res_stride[invariant0[0]]),
+                out_n_batch=len(inplace),
+                out_batch_sizes=tuple(int(s) for s in inplace_shape),
+                out_batch_strides=tuple(int(res_stride[ax]) for ax in inplace),
+            )
+        else:
+            fuse_fields = dict(_NO_FUSE)
+
         # Note: the Cube kernel pads L0/L1/C up to fractal granularity internally
         # (see batched_matmul_kernel_standalone), so no multiple-of-16 restriction on
         # the logical dims is required here — arbitrary shapes (including degenerate
@@ -220,6 +266,7 @@ class EinsumBuilder:
             elementwise=False,
             n_elem=prod(out_shape),
             **_NO_BCAST,
+            **fuse_fields,
         )
 
     def _try_broadcast(self, in0, in1, out, shape0, shape1, out_shape):
@@ -298,6 +345,7 @@ class EinsumBuilder:
             bc_Cc=Cc, bc_Rr=Rr, bc_Inner=inner, bc_Outer=outer,
             bc_sizeB=size_b, bc_full_is_in0=full_is_in0,
             bc_outer_dims=outer_dims, bc_outer_bstride=outer_bstride,
+            **_NO_FUSE,
         )
 
     def transpose_config_gen(self, name: str, shape: tuple[int, ...], perm: tuple[int, ...]):
@@ -367,6 +415,11 @@ class EinsumBuilder:
         # each tile to its padded dim.
         tile = int(os.getenv("EINSUM_TILE_SIZE", "128"))
         L0, L1, C = self.recipe['L0'], self.recipe['L1'], self.recipe['C']
+        # Fused-output arrays must hold >=1 element (C++ forbids zero-length arrays);
+        # a non-fusible / batch-free config emits a dummy {0} the kernel never reads
+        # (its loop runs over out_n_batch == 0).
+        batch_sizes = self.recipe['out_batch_sizes'] or (0,)
+        batch_strides = self.recipe['out_batch_strides'] or (0,)
         return dict(
             tpose_inp0_name=tpose_inp0_name,
             tpose_inp1_name=tpose_inp1_name,
@@ -378,6 +431,12 @@ class EinsumBuilder:
             tile_m=tile,
             tile_n=tile,
             tile_k=self._tile_k(tile, L0, L1, C),
+            out_fusible=self.recipe['out_fusible'],
+            out_row_stride=self.recipe['out_row_stride'],
+            out_n_batch=self.recipe['out_n_batch'],
+            NB=len(batch_sizes),
+            out_batch_sizes=', '.join(str(x) for x in batch_sizes),
+            out_batch_strides=', '.join(str(x) for x in batch_strides),
         )
 
     def parse_equation(self):

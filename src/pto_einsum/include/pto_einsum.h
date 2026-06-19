@@ -700,6 +700,21 @@ struct MatmulGeom {
     static constexpr unsigned total_tiles = I * tiles_per_batch;
 };
 
+// Fused output permutation gate. When the einsum output's free0/free1 are each a
+// single axis and free1 is the innermost output axis (res col stride 1), the Cube's
+// fixpipe store can land each validM x validN tile straight into `res` at its permuted
+// position — dropping Phase C, the second SyncAll and the ws_res buffer. The host
+// emits the decode data (out_fusible, out_row_stride = res free0 stride, the inplace
+// axes' sizes + res strides) into config_einsum; this struct surfaces it to the kernel
+// (a struct of static constexpr, not a constexpr function, so device code can read it).
+// Mutually exclusive with split-K, which stays gated on the identity-output path.
+template <typename CONFIG_T>
+struct FusibleOutputPerm {
+    static constexpr bool value = (CONFIG_T::out_fusible != 0u);
+    static constexpr unsigned row_stride = CONFIG_T::out_row_stride;  // res stride of free0
+    static constexpr unsigned n_batch = CONFIG_T::out_n_batch;        // # inplace axes
+};
+
 // One output tile, basic per-Kt schedule: contract the K-tile range
 // [kStart, kStart+kCount) of tile `t` and store the result. This is the split-K
 // tile (the plain schedule uses the deeper-pipelined matmul_one_tile_deep below).
@@ -906,7 +921,7 @@ AICORE inline constexpr unsigned deep_pick_kd(unsigned Mt, unsigned Nt, unsigned
 //      GM->L1 load under chunk c's compute.
 // Each tile is self-contained (inits its event flags, drains them before the
 // store), so the scheduler can hand tiles to cores in any order.
-template <typename data_T, typename CONFIG_T>
+template <typename data_T, typename CONFIG_T, bool FUSE_OUT = false>
 AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const data_T* ws1,
                                         __gm__ float* ws_res, unsigned t) {
         using G = MatmulGeom<CONFIG_T>;
@@ -917,6 +932,12 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
         constexpr unsigned Nt = G::Nt;
         constexpr unsigned nN = G::nN;
         constexpr unsigned tiles_per_batch = G::tiles_per_batch;
+        // Fused output store: the destination is `res` (the true out_shape), so the tile
+        // lands at its permuted position with the free0 axis's res stride as the row
+        // stride (free1 is innermost -> col stride 1). Default (FUSE_OUT=false) keeps the
+        // natural ws_res layout (row stride L1) byte-for-byte unchanged.
+        using FOut = FusibleOutputPerm<CONFIG_T>;
+        constexpr unsigned ROW_STRIDE = FUSE_OUT ? FOut::row_stride : L1;
         // Padded-operand geometry (see MatmulGeom): a partial dim loads a full tile from
         // an Ma/Na-padded zero-filled buffer; the store still clamps to real L0/L1.
         static_assert(G::I == 1 || (!G::A_PADDED && !G::B_PADDED),
@@ -935,7 +956,7 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
         using ShapeB = pto::Shape<1, 1, 1, Kd, -1>;
         using StrideB = pto::Stride<1, 1, 1, Bcols, 1>;
         using ShapeC = pto::Shape<1, 1, 1, -1, -1>;
-        using StrideC = pto::Stride<1, 1, 1, L1, 1>;
+        using StrideC = pto::Stride<1, 1, 1, ROW_STRIDE, 1>;
         using MatTileA = pto::Tile<pto::TileType::Mat, data_T, Mt, Kd, pto::BLayout::ColMajor, -1, -1, pto::SLayout::RowMajor, 512>;
         using MatTileB = pto::Tile<pto::TileType::Mat, data_T, Kd, Nt, pto::BLayout::ColMajor, -1, -1, pto::SLayout::RowMajor, 512>;
         using LeftTileA = pto::TileLeft<data_T, Mt, Kq, -1, -1>;
@@ -1071,8 +1092,23 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
         // Store accumulator -> GM (F32 acc, NZ->ND), then free L0C for the next tile.
         set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
         wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
-        pto::GlobalTensor<float, ShapeC, StrideC> cg(
-            ws_res + i * L0 * L1 + row0 * L1 + col0, ShapeC(validM, validN));
+        // Base offset of this tile's (row0,col0) corner in the destination. Natural
+        // layout: i*L0*L1 + row0*L1 + col0. Fused: decode the flat batch index `i`
+        // row-major over the inplace axes into a res base (Σ idx_k·res_stride_k), then
+        // add row0·ROW_STRIDE + col0 (free1 innermost -> unit col stride).
+        unsigned base;
+        if constexpr (FUSE_OUT) {
+            base = row0 * ROW_STRIDE + col0;
+            unsigned rem = i;
+            #pragma unroll
+            for (int k = int(FOut::n_batch) - 1; k >= 0; --k) {
+                base += (rem % CONFIG_T::out_batch_sizes[k]) * CONFIG_T::out_batch_strides[k];
+                rem /= CONFIG_T::out_batch_sizes[k];
+            }
+        } else {
+            base = i * L0 * L1 + row0 * L1 + col0;
+        }
+        pto::GlobalTensor<float, ShapeC, StrideC> cg(ws_res + base, ShapeC(validM, validN));
         TSTORE(cg, c_l0);
         set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
         wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
@@ -1082,7 +1118,7 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
 // guards with `if constexpr (DAV_CUBE)` and supplies the block index/count.
 // SPLITK enables the split-K schedule (see batched_matmul_inline body); it is off
 // for the standalone matmul and on only for fused configs with idle cores.
-template <typename data_T, typename CONFIG_T, bool SPLITK = false>
+template <typename data_T, typename CONFIG_T, bool SPLITK = false, bool FUSE_OUT = false>
 AICORE inline void batched_matmul_inline(__gm__ const data_T* ws0, __gm__ const data_T* ws1,
                                          __gm__ float* ws_res, unsigned block_idx, unsigned block_num) {
         using G = MatmulGeom<CONFIG_T>;
@@ -1133,7 +1169,7 @@ AICORE inline void batched_matmul_inline(__gm__ const data_T* ws0, __gm__ const 
         unsigned start = block_idx * chunk;
         unsigned end = (start + chunk) < total_tiles ? (start + chunk) : total_tiles;
         for (unsigned t = start; t < end; t++) {
-            matmul_one_tile_deep<data_T, CONFIG_T>(ws0, ws1, ws_res, t);
+            matmul_one_tile_deep<data_T, CONFIG_T, FUSE_OUT>(ws0, ws1, ws_res, t);
         }
 }
 
@@ -1710,6 +1746,11 @@ __global__ AICORE void einsum_fused_kernel(
     set_ffts_base_addr(ffts_addr);
 
     constexpr bool OUT_IDENTITY = IsIdentityPerm<typename CONFIG_T::tpose_out_conf>::value;
+    // Fused output permutation: the Cube store lands each tile straight into res in
+    // permuted order, so (like identity output) Phase C and the second barrier drop and
+    // ws_res is not allocated. OUT_DIRECT covers both "matmul writes res directly" cases.
+    constexpr bool FUSE_OUT = FusibleOutputPerm<CONFIG_T>::value && !OUT_IDENTITY;
+    constexpr bool OUT_DIRECT = OUT_IDENTITY || FUSE_OUT;
     // Inputs whose copy into the workspace is redundant (identity perm + K==C) are
     // read straight from data0/data1; their Phase A transpose is skipped below.
     constexpr bool SKIP0 = EinsumSkip<CONFIG_T>::inp0;
@@ -1780,14 +1821,14 @@ __global__ AICORE void einsum_fused_kernel(
         // configs (identity, thin grid) hand idle cores K-slices that atomic-add
         // into the pre-zeroed res. The matmul reads each input from the workspace, or
         // straight from the raw tensor when its copy was skipped (SKIP0/SKIP1).
-        __gm__ float* mm_out = OUT_IDENTITY ? res : ws_res;
+        __gm__ float* mm_out = OUT_DIRECT ? res : ws_res;
         __gm__ const data_T* mmA = SKIP0 ? data0 : static_cast<__gm__ const data_T*>(ws0);
         __gm__ const data_T* mmB = SKIP1 ? data1 : static_cast<__gm__ const data_T*>(ws1);
-        batched_matmul_inline<data_T, CONFIG_T, SPLITK_ELIGIBLE>(mmA, mmB, mm_out, get_block_idx(), get_block_num());
+        batched_matmul_inline<data_T, CONFIG_T, SPLITK_ELIGIBLE, FUSE_OUT>(mmA, mmB, mm_out, get_block_idx(), get_block_num());
     }
 #endif  // EINSUM_PHASE_STOP >= 2
 
-    if constexpr (!OUT_IDENTITY) {
+    if constexpr (!OUT_DIRECT) {
         SyncAll<false>();  // matmul done -> output transpose
 
 #if EINSUM_PHASE_STOP >= 3
@@ -1841,9 +1882,11 @@ void* einsum_setup(void* stream = nullptr) {
     const size_t ws1_elems = SKIP1 ? 0 : einsum_ws1_elems<data_T, CONFIG_T>();
     const size_t ws0_bytes = sizeof(data_T) * ws0_elems;
     const size_t ws1_bytes = sizeof(data_T) * ws1_elems;
-    // Identity output writes straight to res, so ws_res is never read — don't alloc it.
+    // Identity or fused output writes straight to res, so ws_res is never read — don't
+    // alloc it. FusibleOutputPerm carries the same permuted-store gate as the kernel.
     constexpr bool OUT_IDENTITY = IsIdentityPerm<typename CONFIG_T::tpose_out_conf>::value;
-    const size_t wsr_bytes = OUT_IDENTITY ? 0 : sizeof(float) * CONFIG_T::tpose_out_conf::N;
+    constexpr bool OUT_DIRECT = OUT_IDENTITY || FusibleOutputPerm<CONFIG_T>::value;
+    const size_t wsr_bytes = OUT_DIRECT ? 0 : sizeof(float) * CONFIG_T::tpose_out_conf::N;
 
     // A pure plain matmul (both inputs skipped, identity output) needs no workspace at
     // all; allocate a token byte so the runner caches a non-null handle and does not

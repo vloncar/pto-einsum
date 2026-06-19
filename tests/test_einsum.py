@@ -46,10 +46,19 @@ from pto_einsum import einsum, EinsumBuilder
     ("ji, jk -> ik", (512, 500), (512, 64)),
 
     # --- non-identity output permutation (Phase C transpose runs) ---
-    ("ij, jk -> ki", (32, 64), (64, 48)),          # output transposed
+    ("ij, jk -> ki", (32, 64), (64, 48)),          # output transposed (free1 not innermost
+                                                   # -> non-fusible, keeps Phase C)
     # custom index layouts (transposed inputs and/or output)
     ("ai, ja -> ij", (32, 16), (64, 32)),
-    ("abc, cd -> abd", (32, 16, 32), (32, 64)),
+    ("abc, cd -> abd", (32, 16, 32), (32, 64)),    # multi-axis free0 -> non-fusible
+
+    # --- fused output permutation (free0/free1 single axes, free1 innermost in res) ---
+    # The Cube store lands each tile straight into res, dropping Phase C. The dominant
+    # attention contractions: batched over (b,h), so the store row stride is H*T (!= L1).
+    ("bshd, bthd -> bsht", (2, 128, 4, 64), (2, 128, 4, 64)),   # ->bsht, K==C
+    ("bshd, bthd -> bsht", (2, 64, 4, 32), (2, 96, 4, 32)),     # asymmetric S!=T, sub-tile
+    ("bsht, bthd -> bshd", (2, 128, 4, 128), (2, 128, 4, 64)),  # ->bshd (contract t)
+    ("shd, thd -> sht", (200, 1, 64), (128, 1, 64)),            # single-batch partial-M tile
 
     # --- batched matmul (I > 1) ---
     # batch dim > 20 so the per-batch tiles distribute across cores

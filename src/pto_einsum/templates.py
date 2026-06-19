@@ -24,6 +24,18 @@ einsum_config_template = """struct config_einsum {{
     static const unsigned tile_m = {tile_m};
     static const unsigned tile_n = {tile_n};
     static const unsigned tile_k = {tile_k};
+
+    // Fused output permutation (drop Phase C). When the output's free0/free1 are each
+    // a single axis and free1 is the innermost output axis (res col stride 1), the
+    // Cube store lands each tile straight into res in permuted order. out_fusible is
+    // 0/1; out_row_stride is res's free0 (row) stride; the batch arrays decode the
+    // flat batch index into a res base offset (res strides of the inplace axes, in
+    // out-natural order). All zero/neutral when not fusible.
+    static constexpr unsigned out_fusible = {out_fusible};
+    static constexpr unsigned out_row_stride = {out_row_stride};
+    static constexpr unsigned out_n_batch = {out_n_batch};
+    static constexpr unsigned out_batch_sizes[{NB}] = {{{out_batch_sizes}}};
+    static constexpr unsigned out_batch_strides[{NB}] = {{{out_batch_strides}}};
 }};
 """
 elementwise_config_template = """struct config_elementwise {{
