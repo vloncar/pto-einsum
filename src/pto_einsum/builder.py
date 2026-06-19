@@ -14,6 +14,19 @@ from . import templates
 # Used as the compiler include path and exposed for out-of-package builds.
 INCLUDE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "include")
 
+# Max A elements streamed per Vector block in the broadcast kernel (matches
+# BCAST_TILECAP in pto_einsum.h); a ColExpand op whose innermost broadcast run exceeds
+# this falls through to the matmul path (would need in-kernel column blocking).
+BCAST_TILECAP = 4096
+# The scalar-mode broadcast operand is loaded whole into UB once; keep it bounded.
+_BCAST_SCALAR_SIZE_CAP = 8192
+
+# Neutral broadcast fields for the non-broadcast recipe return paths (elementwise, matmul).
+_NO_BCAST = dict(
+    broadcast=False, bc_mode=0, bc_Cc=1, bc_Rr=1, bc_Inner=1, bc_Outer=1,
+    bc_sizeB=1, bc_full_is_in0=True, bc_outer_dims=(), bc_outer_bstride=(),
+)
+
 class EinsumRecipe(TypedDict):
     in_transpose_idxs: tuple[tuple[int, ...], tuple[int, ...]]
     L0: int
@@ -32,6 +45,21 @@ class EinsumRecipe(TypedDict):
     # matmul fields above are then unused. n_elem is the total element count.
     elementwise: bool
     n_elem: int
+    # Pure broadcast / scaling: empty contraction, one operand carries every output axis
+    # (the "full" operand, in output order) and the other a strict subset, broadcast over
+    # the axes it lacks (e.g. `bsd,d->bsd`, `bshd,sd->bshd`, `hqk,h->hqk`). Routed to the
+    # Vector broadcast-multiply kernel (broadcast_mul). The matmul fields above are unused.
+    # bc_mode: 0 = ColExpand (B varies along inner cols), 1 = scalar (B constant per group).
+    broadcast: bool
+    bc_mode: int
+    bc_Cc: int           # ColExpand column-vector length (mode 0)
+    bc_Rr: int           # ColExpand broadcast-row count (mode 0)
+    bc_Inner: int        # per-group contiguous A region (Rr*Cc for mode 0, inner block mode 1)
+    bc_Outer: int        # number of output groups
+    bc_sizeB: int        # element count of the broadcast operand
+    bc_full_is_in0: bool # which raw operand is the full (contiguous) one
+    bc_outer_dims: tuple      # OUTER axis sizes, outermost first
+    bc_outer_bstride: tuple   # broadcast-operand element stride per OUTER axis
 
 class EinsumBuilder:
     def __init__(self, equation: str, input_shapes: list[tuple[int, ...]], dtype: torch.dtype, device: str = "npu"):
@@ -123,12 +151,23 @@ class EinsumBuilder:
                 L0=1, L1=1, I=prod(out_shape), C=1,
                 elementwise=True,
                 n_elem=prod(out_shape),
+                **_NO_BCAST,
             )
 
         s_in0, s_in1, s_out = set(in0), set(in1), set(out)
         _common = s_in0 & s_in1
         _contract = _common - s_out
         _inplace = _common & s_out
+
+        # Pure broadcast / scaling: no contracted index and exactly one operand carries
+        # every output axis in output order; the other is a strict subset (broadcast). Route
+        # to the Vector broadcast kernel instead of a batch of degenerate 1xC matmuls (which
+        # would also trip the batched-partial-tile guard). The both-subset case (outer
+        # product, e.g. `bi,bj->bij`) is a genuine rank-1 matmul and stays on the Cube path.
+        if not _contract:
+            bc = self._try_broadcast(in0, in1, out, input_shape0, input_shape1, out_shape)
+            if bc is not None:
+                return bc
         contract = sorted(_contract, key=lambda x: in1.index(x))
         inplace = sorted(_inplace, key=lambda x: in1.index(x))
         invariant0 = sorted((s_out - _common) & s_in0, key=lambda x: in0.index(x))
@@ -168,6 +207,85 @@ class EinsumBuilder:
             C=contract_size,
             elementwise=False,
             n_elem=prod(out_shape),
+            **_NO_BCAST,
+        )
+
+    def _try_broadcast(self, in0, in1, out, shape0, shape1, out_shape):
+        """Classify a no-contraction einsum as a broadcast/scaling op, or return None to
+        fall through to the matmul path. Requires the full operand to be in output order and
+        the broadcast operand's axes to appear in output order (no transpose needed)."""
+        # The broadcast kernel is NPU-only; on CPU these fall through to the matmul path,
+        # which the generic CPU einsum reference evaluates correctly.
+        if self.device == "cpu":
+            return None
+        s_in0, s_in1, s_out = set(in0), set(in1), set(out)
+        # Exactly one operand carries every output axis (the "full" one); the other a
+        # strict subset. (Both-full = transpose-elementwise; both-subset = outer product.)
+        full_is_in0 = (s_in0 == s_out)
+        full_is_in1 = (s_in1 == s_out)
+        if full_is_in0 == full_is_in1:
+            return None
+        full, bc = (in0, in1) if full_is_in0 else (in1, in0)
+        # The full operand must already be in output order (else it needs a transpose).
+        if full != out:
+            return None
+        n = len(out)
+        sizes = list(out_shape)
+        s_bc = set(bc)
+        bc_positions = [out.index(ax) for ax in bc]
+        if bc_positions != sorted(bc_positions):  # broadcast axes out of output order
+            return None
+
+        # Broadcast-operand element stride per output axis (0 where B is absent), built from
+        # the innermost axis outward (B is contiguous in output order).
+        bstride = [0] * n
+        running = 1
+        for p in range(n - 1, -1, -1):
+            if out[p] in s_bc:
+                bstride[p] = running
+                running *= sizes[p]
+        size_b = prod(sizes[p] for p in bc_positions) if bc_positions else 1
+
+        present = [out[p] in s_bc for p in range(n)]
+        if present[n - 1]:
+            mode = 0  # ColExpand: B varies along the innermost contiguous run
+            p = n - 1
+            Cc = 1
+            while p >= 0 and present[p]:
+                if Cc * sizes[p] > BCAST_TILECAP:
+                    return None  # innermost B-present run exceeds a UB tile; needs C-blocking
+                Cc *= sizes[p]; p -= 1
+            Rr = 1
+            while p >= 0 and not present[p]:
+                Rr *= sizes[p]; p -= 1
+            inner = Rr * Cc
+        else:
+            mode = 1  # scalar: B is constant across the inner block
+            if size_b > _BCAST_SCALAR_SIZE_CAP:
+                return None  # broadcast operand loaded whole into UB; keep it small
+            p = n - 1
+            inner = 1
+            while p >= 0 and not present[p]:
+                inner *= sizes[p]; p -= 1
+            Cc, Rr = 1, 1
+        outer_axes = list(range(0, p + 1))      # output positions above the inner block
+        outer_dims = tuple(sizes[q] for q in outer_axes)
+        outer_bstride = tuple(bstride[q] for q in outer_axes)
+        outer = prod(outer_dims) if outer_dims else 1
+
+        return EinsumRecipe(
+            in_transpose_idxs=((), ()),
+            out_interpret_shape=out_shape,
+            out_transpose_idxs=tuple(range(n)),
+            out_shape=out_shape,
+            L0=1, L1=1, I=prod(out_shape), C=1,
+            elementwise=False,
+            n_elem=prod(out_shape),
+            broadcast=True,
+            bc_mode=mode,
+            bc_Cc=Cc, bc_Rr=Rr, bc_Inner=inner, bc_Outer=outer,
+            bc_sizeB=size_b, bc_full_is_in0=full_is_in0,
+            bc_outer_dims=outer_dims, bc_outer_bstride=outer_bstride,
         )
 
     def transpose_config_gen(self, name: str, shape: tuple[int, ...], perm: tuple[int, ...]):
@@ -262,7 +380,7 @@ class EinsumBuilder:
         # than a kernel static_assert. The contraction dim never gates (tile_k divides
         # padded K); only the free dims L0/L1 matter.
         L0, L1, I = self.recipe['L0'], self.recipe['L1'], self.recipe['I']
-        if I > 1:
+        if I > 1 and not self.recipe['elementwise'] and not self.recipe['broadcast']:
             pad16 = lambda x: (x + 15) // 16 * 16
             tile = int(os.getenv("EINSUM_TILE_SIZE", "128"))
             Mpad, Npad = pad16(L0), pad16(L1)
@@ -295,6 +413,25 @@ class EinsumBuilder:
             tmpl = templates.cpu_lib_elementwise_template if self.device == "cpu" \
                 else templates.shared_lib_elementwise_template
             self.cpp_code = tmpl.format(config_code=config_code, data_t=data_t)
+            self.code_hash = hashlib.md5(self.cpp_code.encode('utf-8')).hexdigest()
+            self.target_dir = os.path.join(self.build_base, self.code_hash)
+            return
+
+        # Broadcast / scaling path: a single config + a Vector kernel call (NPU only).
+        if self.recipe['broadcast']:
+            r = self.recipe
+            outer_dims = r['bc_outer_dims'] or (1,)        # pad to >=1 element (rank 0 -> dummy)
+            outer_bstride = r['bc_outer_bstride'] or (0,)
+            config_code = templates.broadcast_config_template.format(
+                mode=r['bc_mode'], N=r['n_elem'], Cc=r['bc_Cc'], Rr=r['bc_Rr'],
+                Inner=r['bc_Inner'], Outer=r['bc_Outer'], sizeB=r['bc_sizeB'],
+                outer_rank=len(r['bc_outer_dims']), OR=max(1, len(r['bc_outer_dims'])),
+                outer_dims=', '.join(map(str, outer_dims)),
+                outer_bstride=', '.join(map(str, outer_bstride)),
+            )
+            full, bcast = ('input0', 'input1') if r['bc_full_is_in0'] else ('input1', 'input0')
+            self.cpp_code = templates.shared_lib_broadcast_template.format(
+                config_code=config_code, data_t=data_t, full=full, bcast=bcast)
             self.code_hash = hashlib.md5(self.cpp_code.encode('utf-8')).hexdigest()
             self.target_dir = os.path.join(self.build_base, self.code_hash)
             return
@@ -409,9 +546,9 @@ class EinsumBuilder:
             ctypes.c_void_p               # stream
         ]
         
-        # The elementwise path exposes only the run_einsum* entry points (no
-        # transpose / batched_matmul symbols exist in its .so), so skip their setup.
-        if self.device == "npu" and not self.recipe['elementwise']:
+        # The elementwise and broadcast paths expose only the run_einsum* entry points (no
+        # transpose / batched_matmul symbols exist in their .so), so skip their setup.
+        if self.device == "npu" and not self.recipe['elementwise'] and not self.recipe['broadcast']:
             self.lib.run_transpose_inp0.argtypes = transpose_sig
             self.lib.run_transpose_inp0.restype = None
             
@@ -464,8 +601,9 @@ class EinsumBuilder:
 
         # Split-K configs have the cores atomic-add into the output, so it must start
         # zeroed (see _splitk_eligible). self.recipe is populated by generate_code().
-        # The elementwise path has no matmul, so it is never split-K.
-        self._splitk = False if self.recipe['elementwise'] else self._splitk_eligible()
+        # The elementwise and broadcast paths have no matmul, so they are never split-K.
+        self._splitk = False if (self.recipe['elementwise'] or self.recipe['broadcast']) \
+            else self._splitk_eligible()
 
         # Return a Callable wrapper that validates inputs
         def run(*operands):

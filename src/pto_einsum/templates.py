@@ -56,6 +56,43 @@ extern "C" {{
 }}
 """
 
+broadcast_config_template = """struct config_broadcast {{
+    static constexpr int mode = {mode};
+    static constexpr unsigned N = {N};
+    static constexpr unsigned Cc = {Cc};
+    static constexpr unsigned Rr = {Rr};
+    static constexpr unsigned Inner = {Inner};
+    static constexpr unsigned Outer = {Outer};
+    static constexpr unsigned sizeB = {sizeB};
+    static constexpr unsigned outer_rank = {outer_rank};
+    static constexpr unsigned outer_dims[{OR}] = {{{outer_dims}}};
+    static constexpr unsigned outer_bstride[{OR}] = {{{outer_bstride}}};
+}};
+"""
+
+# Broadcast / scaling variant. Like the elementwise path, it reuses the run_einsum* entry
+# names so builder dispatch is unchanged. `full`/`bcast` are input0/input1 in whichever
+# order puts the full (contiguous) operand first (the broadcast kernel's first argument).
+shared_lib_broadcast_template = """#include "pto_einsum.h"
+
+{config_code}
+
+extern "C" {{
+    void run_einsum(const {data_t}* input0, const {data_t}* input1, float* output, void* stream) {{
+        pto_einsum::broadcast_mul<{data_t}, config_broadcast>({full}, {bcast}, output, stream);
+    }}
+    void* run_einsum_setup(void* stream) {{
+        return pto_einsum::broadcast_setup(stream);
+    }}
+    void run_einsum_exec(const {data_t}* input0, const {data_t}* input1, float* output, void* workspace, void* stream) {{
+        pto_einsum::broadcast_exec<{data_t}, config_broadcast>({full}, {bcast}, output, workspace, stream);
+    }}
+    void run_einsum_teardown(void* workspace) {{
+        pto_einsum::einsum_teardown(workspace);
+    }}
+}}
+"""
+
 cpu_lib_elementwise_template = """#include "cpu_einsum.h"
 #include <stdio.h>
 

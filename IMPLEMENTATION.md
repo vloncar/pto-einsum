@@ -146,16 +146,20 @@ implementation (`transpose_2d_inline`) has two structural cases:
   the Cube matmul distributes its output-tile grid) — large transposes use the
   whole vector engine, not a single core. The per-block GM rows start at
   `r·srcCols` / `c·srcRows`, so this path requires 16-aligned dims to keep
-  every transfer 32-byte aligned (a **GM-DMA** constraint, not a `TTRANS` one; a
-  `static_assert` enforces it; unaligned-large is not yet supported). Boundary
+  every transfer 32-byte aligned. The block *base* address is always 32-byte
+  aligned (`r0`/`c0` are multiples of `BR`/`BC` = 64), and the GM↔UB transfers are
+  element-granular ND copies, so a non-16-aligned row stride (`srcCols` / `dpad`)
+  only shifts successive rows to sub-32B offsets — which the ND DMA handles — so
+  arbitrary (unaligned) dims work here too, validated on dav-2201. Boundary
   blocks are partial (`< BR/BC`); each `TLOAD`/`TSTORE` therefore carries a
   **DYNAMIC GM window of the real `rb/cb`** dims, not the padded `BR×BC` — a static
   window over-reads the source and over-writes the neighbouring output block (a
   latent bug masked while every blocked test used 64-multiple dims).
 
 So the cases are: (1) any tensor that fits UB → fully general hardware transpose;
-(2) large 16-aligned tensors → blocked hardware transpose; (3) large *unaligned*
-tensors → not yet supported (blocked by the GM-DMA alignment, not by `TTRANS`).
+(2) large tensors → blocked hardware transpose, arbitrary (including unaligned and
+odd) dims — the dynamic per-block GM window carries the real `rb`/`cb`, and the
+element-granular ND DMA tolerates non-32-byte-aligned row strides.
 
 #### N-D transposes
 
@@ -302,6 +306,49 @@ multi-repeat `TCVT` latency hides the window, which is why this once looked like
 "small/partial-tile fp16 hardware quirk" — it is not. Bare `TCVT` is correct at every
 size; an isolating reproducer (single op, properly synced) is in
 `bug_report/FINDINGS.md`. fp32 has no `TCVT`, so no intra-`V` hazard.
+
+## 1.4 Broadcast / scaling path (`broadcast_mul`)
+
+Another no-contraction case: one operand (the "full" operand) carries every output
+axis in output order, the other a strict subset, broadcast over the axes it lacks —
+e.g. `bsd,d->bsd` (rms_norm), `bsd,sd->bsd` (token_pos), `bshd,sd->bshd` (rope),
+`hqk,h->hqk` (alibi). There is no contraction and no transpose, so like the Hadamard
+path it bypasses the matmul pipeline; `parse_recipe` flags it (`recipe.broadcast`,
+NPU only) and `_try_broadcast` classifies the layout. The output is always `float32`.
+
+The broadcast operand cannot be loaded with a stride-0 GM access (the MTE rejects it
+as out of range), so it is materialized in the Vector engine. Two kernel modes:
+
+- **Mode 0 — `TCOLEXPANDMUL`** when the innermost output axis is present in the
+  broadcast operand. The full operand is streamed as `[rb × Cc]` row blocks and the
+  broadcast operand as a `[1 × Cc]` row vector that the hardware column-expand
+  multiply broadcasts down the rows (`dst[r,c] = A[r,c] · B[c]`). `Cc` is the inner
+  contiguous run of present axes (capped at `BCAST_TILECAP`; a single inner axis
+  larger than the cap falls through to the matmul path), `Rr` the adjacent broadcast
+  rows. Any further outer axes are walked by a mixed-radix odometer (`bcast_baseB`)
+  that projects each output group to its broadcast-operand offset (stride 0 on absent
+  axes), which is what makes rope's interior-strided broadcast work.
+- **Mode 1 — scalar (`Tile::GetValue` + `TMULS`)** when the innermost axis is absent,
+  so the broadcast operand is constant per group (e.g. alibi's per-head slope). The
+  (small) operand is loaded once into UB and each group's scalar is read with
+  `GetValue` and applied with a tile×scalar multiply.
+
+Rows are flattened over `(group, row)` and split across cores; each lane's span is
+rounded up to a `BCAST_LINE_ELEMS`-aligned boundary so adjacent cores never write a
+shared cache line (sub-line spans would clobber each other and drop rows). Two
+subtleties bit here and are worth recording:
+
+- **Runtime row extent.** A lane's trailing block has `rb < RB` rows. The GM tensor's
+  row dimension must therefore be the *runtime* `rb` (a `-1` dynamic dim, as the
+  matmul uses for `validM`), not the static `RB` — otherwise `TLOAD`/`TSTORE` iterate
+  the full `RB` rows and the last lane reads/writes past the operand buffer (OOB →
+  `NaN`). The 1-row scalar path is immune (its `SetValidCol` bounds the load length).
+- **Final-store drain.** Each block's `WAR` flag (`MTE3→MTE2`) only orders a store
+  ahead of the *next* load, so the last block's store is never awaited. Multi-core
+  paths get an implicit drain from the cross-core barrier, but a small broadcast op
+  runs on core 0 alone, so its store can still be in flight when the host reads the
+  output back — yielding stale data at reused GM addresses. A single
+  `pipe_barrier(PIPE_ALL)` at the end of the kernel drains it.
 
 ---
 
@@ -501,10 +548,17 @@ stale `.so` is reused and the change appears to have no effect.
   so every tile loads full; the store clamps to the real dim. Output dims are now
   arbitrary. Currently single-batch (`I==1`) only — a batched partial config needs
   the per-batch row/col block padded, rejected with a `ValueError` for now.
-- Support unaligned *large* 2D transposes, removing the blocked-transpose
-  16-aligned constraint. This is the remaining blocker for *arbitrary* (large,
-  non-16-aligned) linear-attention sequence lengths — the matmul handles them, but
-  the QKᵀ input transpose for e.g. `seqlen=1000` hits this. 16-aligned (or small)
-  lengths already work.
-- Pure broadcast / scaling ops (`bsd,d->bsd`, `rms_norm`, `rope`) — empty
-  contraction, a Vector-only broadcast-multiply path, not a matmul.
+- **Done:** unaligned *large* 2D transposes. The blocked-transpose 16-aligned
+  `static_assert` was conservative — the block base is always 32-byte aligned and
+  the GM↔UB transfers are element-granular ND copies, so the dynamic per-block
+  window already handles arbitrary (non-16-aligned, odd) dims. Dropping the assert
+  unblocks *arbitrary* large linear-attention sequence lengths: the QKᵀ input
+  transpose for e.g. `seqlen=1000` now works end-to-end (chain correctness `yes`,
+  fp32 + fp16).
+- **Done:** pure broadcast / scaling ops (`bsd,d->bsd` rms_norm, `bsd,sd->bsd`
+  token_pos, `bshd,sd->bshd` rope, `hqk,h->hqk` alibi) — empty contraction, a
+  Vector-only broadcast-multiply path (`broadcast_mul`, §1.4), not a matmul. Both
+  modes (column-expand and scalar) and the interior-strided (rope) case are covered,
+  fp32 + fp16. Remaining limit: an inner present-axis run larger than `BCAST_TILECAP`
+  (e.g. token_pos at `d=512` → `Cc=8192`) still falls through to the matmul path —
+  in-kernel column blocking of the `[rb × Cc]` tile would lift it.

@@ -145,6 +145,64 @@ def test_linear_attention_chain(dtype, T, S, N, P):
     torch.testing.assert_close(O.float(), ref, rtol=rtol, atol=atol)
 
 
+# Broadcast / scaling ops: no contracted index, one operand carries every output
+# axis (the "full" operand, in output order) and the other a strict subset that is
+# broadcast over the axes it lacks. Routed to the Vector broadcast-multiply kernel.
+# These cover both kernel modes: mode 0 (ColExpand, B varies along the inner cols:
+# rms_norm / token_pos / rope) and mode 1 (scalar, B constant per group: alibi).
+BROADCAST_CASES = [
+    ("bsd, d -> bsd",     (2, 8, 64),    (64,)),       # rms_norm-like  (mode 0, Cc=64,  single group)
+    ("bsd, sd -> bsd",    (2, 8, 64),    (8, 64)),      # token_pos      (mode 0, Cc=512, broadcast over b)
+    ("bshd, sd -> bshd",  (2, 8, 4, 16), (8, 16)),      # rope-like      (mode 0, interior-strided broadcast)
+    ("hqk, h -> hqk",     (8, 16, 16),   (8,)),         # alibi          (mode 1, scalar per outer row)
+    # Larger configs that spread rows across multiple Vector cores with a partial
+    # trailing block (rb < RB): the GM row extent must be the runtime rb, else the
+    # last lane over-reads past the operand buffer (was NaN before the runtime-dim fix).
+    ("bsd, d -> bsd",     (2, 16, 512),  (512,)),       # rms_norm Cc=512, Rr=32 over ~8 lanes
+    ("bshd, sd -> bshd",  (4, 32, 8, 64),(32, 64)),     # rope Cc=64, Outer=128, multi-lane
+]
+
+
+@pytest.mark.parametrize("equation, shape0, shape1", BROADCAST_CASES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_broadcast_correctness(equation, shape0, shape1, dtype):
+    # The broadcast classifier is NPU-only (it returns None on CPU), so these route
+    # to the Vector broadcast kernel only on device.
+    if TEST_DEVICE != "npu":
+        pytest.skip("broadcast/scaling ops are routed only on NPU")
+
+    inp0 = torch.rand(shape0, dtype=dtype, device=TEST_DEVICE)
+    inp1 = torch.rand(shape1, dtype=dtype, device=TEST_DEVICE)
+
+    result = einsum(equation, inp0, inp1, device=TEST_DEVICE)
+    expected = torch.einsum(equation.replace(" ", ""), inp0.float(), inp1.float())
+
+    rtol, atol = (1e-3, 1e-3) if dtype == torch.float32 else (5e-2, 5e-2)
+    torch.testing.assert_close(result.float(), expected, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_broadcast_multi_op_sequence(dtype):
+    # Regression guard for the single-core store-vs-readback race: distinct broadcast
+    # kernels built and run back-to-back (with cleanup between) used to leave the last
+    # block's GM store in flight, so a small single-core op could read back stale data
+    # from a reused buffer. Same seed/shape across ops makes a stale readback look like
+    # "B not applied". Drained by a kernel-exit pipe_barrier; this exercises that path.
+    if TEST_DEVICE != "npu":
+        pytest.skip("broadcast/scaling ops are routed only on NPU")
+
+    rtol, atol = (1e-3, 1e-3) if dtype == torch.float32 else (5e-2, 5e-2)
+    for name, (equation, shape0, shape1) in enumerate(BROADCAST_CASES):
+        torch.manual_seed(0)
+        inp0 = torch.rand(shape0, dtype=dtype, device=TEST_DEVICE)
+        inp1 = torch.rand(shape1, dtype=dtype, device=TEST_DEVICE)
+        builder = EinsumBuilder(equation, [shape0, shape1], dtype, device=TEST_DEVICE)
+        result = builder.build()(inp0, inp1)
+        expected = torch.einsum(equation.replace(" ", ""), inp0.float(), inp1.float())
+        torch.testing.assert_close(result.float(), expected, rtol=rtol, atol=atol)
+        builder.cleanup()
+
+
 def test_builder_reuse():
     # Verify that we can reuse the builder's return Callable to run multiple evaluations
     equation = "ij, jk -> ik"

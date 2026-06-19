@@ -144,6 +144,20 @@ TRANSPOSE_CASES = [
     ((256, 80), (1, 0), torch.float32),
     ((144, 144), (1, 0), torch.float32),
     ((144, 208), (1, 0), torch.float16),
+    # 3c. Blocked TTRANS with *unaligned* dims (not a multiple of 16, even odd):
+    #     the strided GM<->UB ND copy is element-granular, so a non-32-byte-aligned
+    #     row stride (srcCols / dpad) still transfers correctly. Covers row/col
+    #     non-8-multiples for fp32, odd dims, an extreme 1-wide trailing block
+    #     (257 = 4*64+1), and fp16 (blk=16, so 200/255 are unaligned for it too).
+    ((200, 200), (1, 0), torch.float32),
+    ((250, 130), (1, 0), torch.float32),
+    ((130, 250), (1, 0), torch.float32),
+    ((201, 199), (1, 0), torch.float32),
+    ((333, 257), (1, 0), torch.float32),
+    ((1000, 64), (1, 0), torch.float32),
+    ((250, 130), (1, 0), torch.float16),
+    ((255, 255), (1, 0), torch.float16),
+    ((257, 257), (1, 0), torch.float16),
 ]
 
 

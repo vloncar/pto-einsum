@@ -14,11 +14,12 @@ comparison is "the full linear-attention op, pto's three fused kernels vs torch'
 native contraction".
 
 Sequence length T == S is swept over both powers of two and non-power-of-two
-lengths: the matmul now supports arbitrary output dims (it pads a partial boundary
-tile's operand up to a whole tile). A *large non-16-aligned* length (e.g. 1000)
-still needs the blocked 2D transpose's 16-aligned-dim support -- a separate roadmap
-item -- so the chain build is caught and that length is reported Skipped. The
-feature dims N (key) and P (value) are fixed (defaults mirror the correctness test).
+lengths, including *large non-16-aligned* lengths (e.g. 1000): the matmul supports
+arbitrary output dims (it pads a partial boundary tile's operand up to a whole
+tile), and the blocked 2D transpose now handles unaligned dims too (element-granular
+ND DMA), so the whole chain builds for any length. The ValueError/RuntimeError
+catch is kept as a safety net but no longer expected to trigger for plain lengths.
+The feature dims N (key) and P (value) are fixed (defaults mirror the correctness test).
 
 Note: the pto runner always returns fp32 (the kernel accumulates in fp32), so each
 intermediate is cast back to the working dtype before the next step -- exactly the
@@ -44,10 +45,10 @@ RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bench_re
 WARMUP = 5
 RUNS = 50
 
-# Sequence lengths (T == S): powers of two plus non-power-of-two lengths that the
-# matmul partial-tile support now handles (320, 768, 1280 are 16-aligned; 200 isn't
-# but is small enough for the non-blocked transpose).
-SEQ_LENS = [200, 256, 320, 512, 768, 1024, 1280, 2048]
+# Sequence lengths (T == S): powers of two plus non-power-of-two lengths. The matmul
+# partial-tile support handles arbitrary output dims, and the blocked 2D transpose
+# now handles unaligned dims, so large non-16-aligned lengths (1000) work too.
+SEQ_LENS = [200, 256, 320, 512, 768, 1000, 1024, 1280, 2048]
 
 # Fixed feature dims (key dim N, value dim P), mirroring the correctness test.
 N_KEY = 64
@@ -108,10 +109,9 @@ def time_seqlen(seqlen, N, P, dtype):
     try:
         chain = LinearAttentionChain(T, S, N, P, dtype, device="npu")
     except (ValueError, RuntimeError):
-        # ValueError: config rejected by the builder. RuntimeError: kernel failed to
-        # compile -- a non-16-aligned *large* sequence length still needs the blocked
-        # 2D transpose's 16-aligned-dim support (a separate roadmap item from the
-        # matmul partial-tile work that lifted the power-of-two restriction here).
+        # Safety net only: the builder/kernel now accepts arbitrary lengths (matmul
+        # partial tiles + unaligned blocked transpose), so this is not expected to
+        # trigger for a plain T==S sweep; a caught config is reported Skipped.
         return None
     build_s = time.perf_counter() - t_build
 
