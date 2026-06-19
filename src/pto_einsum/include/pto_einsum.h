@@ -193,6 +193,40 @@ AICORE inline void batched_pad_copy_inline(__gm__ const data_T* src, __gm__ data
 // we care about), used to pad UB tile row-strides for the TTRANS hardware path.
 AICORE inline constexpr unsigned align_up(unsigned v, unsigned m) { return (v + m - 1) / m * m; }
 
+// Mixed-radix odometer over the leading NAX output axes (CONFIG_T::to_shape /
+// perm_strides). The N-D transpose loops walk a flat outer index `g` whose source
+// base offset is Σ_k digit_k · perm_strides[k]; the natural decode is a per-step
+// div/mod over the (constexpr) extents. `init()` pays that decompose exactly once,
+// then `advance()` carries the digits with add/compare only — no per-iteration
+// div/mod in the hot loop (carries are rare, so the common case is a single add).
+// MAX_AX bounds the local digit array (einsum operand rank is small).
+template <typename CONFIG_T, unsigned NAX>
+struct PermOdometer {
+    static constexpr unsigned MAX_AX = 8;
+    static_assert(NAX <= MAX_AX, "PermOdometer: operand rank exceeds MAX_AX");
+    unsigned digit[MAX_AX];
+    unsigned base;
+
+    AICORE inline void init(unsigned flat) {
+        base = 0;
+        for (int k = int(NAX) - 1; k >= 0; --k) {
+            unsigned d = flat % CONFIG_T::to_shape[k];
+            digit[k] = d;
+            base += d * CONFIG_T::perm_strides[k];
+            flat /= CONFIG_T::to_shape[k];
+        }
+    }
+
+    AICORE inline void advance() {
+        for (int k = int(NAX) - 1; k >= 0; --k) {
+            base += CONFIG_T::perm_strides[k];
+            if (++digit[k] < CONFIG_T::to_shape[k]) return;       // no carry: done
+            digit[k] = 0;
+            base -= CONFIG_T::to_shape[k] * CONFIG_T::perm_strides[k];  // wrap this axis, carry up
+        }
+    }
+};
+
 // 2D transpose using the TTRANS hardware tile op (vnchwconv). TTRANS transposes
 // a RowMajor src UB tile into a dst UB tile via a scratch tmp tile; it is general
 // over the valid extents (any validRow x validCol) for our b32/b16 dtypes. The
@@ -407,16 +441,12 @@ AICORE inline void transpose_nd_copy_inline(__gm__ const data_T* src, __gm__ dat
     unsigned g0 = lane * chunk;
     unsigned g1 = (g0 + chunk) < nouter ? (g0 + chunk) : nouter;
 
-    for (unsigned g = g0; g < g1; g++) {
-        // Decode the flat outer index into its per-axis components (innermost-most
-        // outer axis first) and accumulate the source base offset.
-        unsigned rem = g, src_base = 0;
-        for (int k = int(dims) - 2; k >= 0; k--) {
-            unsigned e = CONFIG_T::to_shape[k];
-            src_base += (rem % e) * CONFIG_T::perm_strides[k];
-            rem /= e;
-        }
-        __gm__ const data_T* s = src + src_base;
+    // Odometer over the outer axes [0, dims-1): decode this lane's first flat index
+    // once, then carry per step instead of a per-iteration mixed-radix div/mod.
+    PermOdometer<CONFIG_T, dims - 1> odo;
+    odo.init(g0);
+    for (unsigned g = g0; g < g1; g++, odo.advance()) {
+        __gm__ const data_T* s = src + odo.base;
         size_t doff = (ROWS > 0) ? (size_t)(g / ROWS) * PAD_BATCH + (size_t)(g % ROWS) * dstStride
                                  : (size_t)g * dstStride;
         __gm__ data_T* d = dst + doff;
@@ -594,14 +624,12 @@ AICORE inline void transpose_nd_batched_2d_inline(__gm__ const data_T* src, __gm
         unsigned b0 = lane * chunk;
         unsigned b1 = (b0 + chunk) < nbatch ? (b0 + chunk) : nbatch;
 
-        for (unsigned b = b0; b < b1; b++) {
-            unsigned rem = b, src_base = 0;
-            for (int k = int(dims) - 3; k >= 0; k--) {
-                unsigned e = CONFIG_T::to_shape[k];
-                src_base += (rem % e) * CONFIG_T::perm_strides[k];
-                rem /= e;
-            }
-            ttrans_block_inline<data_T, Bb, A, srcRowStride, dstRS>(src + src_base, dst + (size_t)b * dblock);
+        // Odometer over the batch axes [0, dims-2): the trailing two axes form the
+        // per-batch [Bb, A] transpose, so only the leading axes index the source base.
+        PermOdometer<CONFIG_T, dims - 2> odo;
+        odo.init(b0);
+        for (unsigned b = b0; b < b1; b++, odo.advance()) {
+            ttrans_block_inline<data_T, Bb, A, srcRowStride, dstRS>(src + odo.base, dst + (size_t)b * dblock);
         }
     } else {
         // Blocked: tile each [Bb, A] block into BR x BC sub-blocks; flatten
