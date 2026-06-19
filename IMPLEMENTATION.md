@@ -558,3 +558,36 @@ stale `.so` is reused and the change appears to have no effect.
   an FFTS barrier, workspace sizing, dispatch plumbing). The reduced operand then
   feeds the existing transpose→matmul→transpose pipeline unchanged. Keeps the op fused
   and on-device.
+- **Fused output permutation — write the matmul result straight to `res` in the final
+  layout, eliminating Phase C (highest-value item).** *Motivation:* the phase profiler
+  (`benchmarks/profile_phase_overlap.py`, Plan 0) shows that on non-identity-output
+  attention the Cube matmul is only **3–10 %** of the kernel and the **transposes are
+  85–95 %**, with **Phase C (the output transpose) alone 76–85 %** of the total
+  (`bshd,bthd->bsht` at S=512: T_C ≈ 0.45 ms of 0.60 ms; S=1024: 1.1 ms of 1.3 ms — the
+  score matrix is the large `B·S·H·T` tensor while the inputs are tiny `D=64`). This is
+  also *why a Vec↔Cube pipeline overlap was rejected:* its ceiling is `min(Vec,Cube)/total`
+  ≈ the Cube fraction ≈ 5–10 %, whereas removing Phase C removes the 76–85 % directly.
+  *Mechanism:* the Cube's fixpipe store already writes through a strided
+  `GlobalTensor<float, ShapeC, StrideC>` ([pto_einsum.h](src/pto_einsum/include/pto_einsum.h)
+  `matmul_one_tile_*`, `TSTORE(cGlobal, accC)`) — today row stride `L1`, col stride `1`,
+  batch base `i·L0·L1`, i.e. the matmul-natural `[i, L0, L1]` order. Make that store land
+  each `validM×validN` tile **directly in `res` at its permuted position** by deriving
+  `StrideC`/base from the **output** permutation strides (already parsed for
+  `tpose_out_conf`): decode the flat batch index `i` into the batch multi-index, set
+  `base = Σ batch_idx·out_stride[axis] + row0·out_stride[free0] + col0·out_stride[free1]`,
+  row stride `= out_stride[free0]`, col stride `= out_stride[free1]`. Then drop Phase C,
+  the second `SyncAll`, and the `ws_res` allocation — exactly as the identity-output fast
+  path (§2.3) does, generalized from "perm is identity" to "perm keeps `free1` innermost".
+  *Scope / fallback:* applies when the output's innermost axis is the matmul's `free1`
+  (col stride `1` — a contiguous-row strided store, same cost as today's `ws_res` store).
+  This already covers the two dominant attention contractions — `bshd,bthd->bsht`
+  (innermost `t`) and `bsht,bthd->bshd` (innermost `d`). When `free1` is *not* innermost
+  in the output (non-unit col stride), keep the current Phase C — the strided-col fixpipe
+  store is unverified and may be slow. *Work:* thread the output strides into `MatmulGeom`
+  / the per-tile store (replacing the fixed `L1`/`i·L0·L1`), a host-side
+  `IsFusibleOutputPerm` gate selecting fused-store vs Phase C (mirroring `EinsumSkip` /
+  `OUT_IDENTITY`), workspace/`out_shape` plumbing, and tests against `torch.einsum` for
+  both attention shapes (fp32 + fp16, batched, partial tiles). Interaction: split-K
+  (§2.6) currently gates on `OUT_IDENTITY` because it atomic-adds into `res`; a fused
+  permuted store could later extend split-K to permuted outputs (atomic-add into the
+  strided window) — a follow-on, keep the gate as-is initially.

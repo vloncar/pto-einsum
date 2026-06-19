@@ -1655,6 +1655,20 @@ void broadcast_exec(const data_T* a, const data_T* b, float* res,
     broadcast_mul_kernel_standalone<data_T, CONFIG_T><<<core_num, nullptr, stream>>>(a, b, res);
 }
 
+// Phase-profiling gate (Plan 0, transpose↔matmul overlap study). EINSUM_PHASE_STOP
+// caps which fused phases execute their *compute* body, while the cross-core
+// SyncAll barriers always run, so the launch/barrier structure is identical across
+// stop levels and the per-phase wall-time isolates by subtraction:
+//   0 = barriers only (fixed launch+barrier overhead F)
+//   1 = + Phase A (input transposes)        -> t(1)-t(0) = T_A
+//   2 = + Phase B (Cube matmul)             -> t(2)-t(1) = T_B
+//   3 = + Phase C (output transpose) [full] -> t(3)-t(2) = T_C
+// Default 3 reproduces the production kernel exactly (every body enabled), so this
+// is a no-op unless a profiler build passes -DEINSUM_PHASE_STOP=N.
+#ifndef EINSUM_PHASE_STOP
+#define EINSUM_PHASE_STOP 3
+#endif
+
 // ─── Fused single-kernel einsum ──────────────────────────────────────────────
 // One mix-kernel launch (AIC + AIV) runs the whole pipeline, with full
 // cross-core barriers between phases:
@@ -1720,6 +1734,7 @@ __global__ AICORE void einsum_fused_kernel(
         unsigned lane = get_block_idx() * 2 + get_subblockid();
         unsigned nlanes = get_block_num() * 2;
 
+#if EINSUM_PHASE_STOP >= 1
         // input0's transpose output is [.., contract]; pad its innermost contract
         // dim C up to the fractal width K so the Cube reads a full K-wide A. The
         // pad is uniform across all I*L0 rows, so any batch count works directly.
@@ -1753,10 +1768,12 @@ __global__ AICORE void einsum_fused_kernel(
                 transpose_inline<data_T, typename CONFIG_T::tpose_inp1_config>(data1, ws1, lane, nlanes);
             }
         }
+#endif  // EINSUM_PHASE_STOP >= 1
     }
 
     SyncAll<false>();  // inputs transposed -> matmul
 
+#if EINSUM_PHASE_STOP >= 2
     if constexpr (DAV_CUBE) {
         // Identity output: the matmul's natural layout already is res, so write it
         // directly and skip the whole output-transpose pass below. SPLITK_ELIGIBLE
@@ -1768,15 +1785,18 @@ __global__ AICORE void einsum_fused_kernel(
         __gm__ const data_T* mmB = SKIP1 ? data1 : static_cast<__gm__ const data_T*>(ws1);
         batched_matmul_inline<data_T, CONFIG_T, SPLITK_ELIGIBLE>(mmA, mmB, mm_out, get_block_idx(), get_block_num());
     }
+#endif  // EINSUM_PHASE_STOP >= 2
 
     if constexpr (!OUT_IDENTITY) {
         SyncAll<false>();  // matmul done -> output transpose
 
+#if EINSUM_PHASE_STOP >= 3
         if constexpr (DAV_VEC) {
             unsigned lane = get_block_idx() * 2 + get_subblockid();
             unsigned nlanes = get_block_num() * 2;
             transpose_inline<float, typename CONFIG_T::tpose_out_conf>(ws_res, res, lane, nlanes);
         }
+#endif  // EINSUM_PHASE_STOP >= 3
     }
 }
 

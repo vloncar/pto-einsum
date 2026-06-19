@@ -486,8 +486,17 @@ class EinsumBuilder:
     def compile(self):
         os.makedirs(self.target_dir, exist_ok=True)
 
-        self.cpp_filename = os.path.join(self.target_dir, f"einsum_{self.code_hash}.cpp")
-        self.so_filename = os.path.join(self.target_dir, f"einsum_{self.code_hash}.so")
+        # Optional extra compiler flags (e.g. -DEINSUM_PHASE_STOP=N for the phase-overlap
+        # profiler). Unset in normal use -> empty, so filenames and the compile command
+        # are byte-identical to before. When set, they are folded into the cached
+        # filename so distinct define-sets don't collide on one .so.
+        extra_defines = os.environ.get("EINSUM_EXTRA_DEFINES", "").split()
+        tag = ""
+        if extra_defines:
+            tag = "_" + hashlib.md5(" ".join(extra_defines).encode("utf-8")).hexdigest()[:8]
+
+        self.cpp_filename = os.path.join(self.target_dir, f"einsum_{self.code_hash}{tag}.cpp")
+        self.so_filename = os.path.join(self.target_dir, f"einsum_{self.code_hash}{tag}.so")
 
         if not os.path.exists(self.so_filename):
             with open(self.cpp_filename, 'w') as f:
@@ -519,6 +528,7 @@ class EinsumBuilder:
                     "-I", f"{pto_lib_path}/include",
                     "-L", f"{ascend_path}/lib64",
                     "-lascendcl", "-lruntime",
+                    *extra_defines,
                     self.cpp_filename, "-o", self.so_filename
                 ]
             
