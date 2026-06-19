@@ -591,3 +591,36 @@ stale `.so` is reused and the change appears to have no effect.
   (§2.6) currently gates on `OUT_IDENTITY` because it atomic-adds into `res`; a fused
   permuted store could later extend split-K to permuted outputs (atomic-add into the
   strided window) — a follow-on, keep the gate as-is initially.
+- **Distributed (multi-NPU) einsum — overlapped ring/context-parallel attention only;
+  *not* a general distributed einsum.** *Context:* PTO-ISA ships a complete inter-NPU
+  set on a2a3 (910B/910C) under `include/pto/comm/`: one-sided `TPUT`/`TGET` plus
+  **`TPUT_ASYNC`/`TGET_ASYNC` over SDMA** (with a separate `AsyncEvent::Wait`), signals
+  (`TNOTIFY`/`TWAIT`/`TTEST`), and collectives (`TGATHER`/`TSCATTER`/`TBROADCAST`/
+  `TREDUCE`) over a `ParallelGroup`. So feasibility is not the blocker. *Why most of it
+  is not worth building:* in an LLM stack, distribution is orchestrated one level up —
+  the framework + HCCL insert collectives *between* kernels (DP grad all-reduce, TP
+  all-reduce/all-gather around projections, PP send/recv, MoE all-to-all). Re-doing any
+  of that inside a two-operand einsum buys nothing over HCCL. In-kernel communication
+  only wins where the comm↔compute overlap is *algorithm-intrinsic* and a framework
+  barrier would force serialization. *The one target that qualifies:* **ring /
+  context-parallel attention** — shard the sequence across N ranks, compute local
+  attention on block `i` while `TGET_ASYNC`-ing rank `i+1`'s K/V block around the ring
+  and accumulating online-softmax-style. It is our existing attention contraction with a
+  comm ring wrapped around the K-loop; the cross-device KV transfer is large and genuinely
+  hideable behind attention compute, so unlike the Phase-overlap case (rejected, ≤10 %
+  ceiling — see "Fused output permutation") the overlap ceiling here is high. It also
+  unlocks long-context, extending the arbitrary-seqlen / partial-tile direction. *Two
+  hard gates before any code (Plan-0 discipline):* (1) **confirm hardware** — ≥2 NPUs in
+  a reachable `ParallelGroup` on the dev box; single-die ⇒ dead on arrival; (2)
+  **measure the ratio** — a small `TGET_ASYNC` round-trip microbench (KV-block transfer
+  time vs. per-block attention compute) at a couple of seqlens; if transfer ≫ compute
+  even fully overlapped, it is bandwidth-bound and the ring buys little; if comparable,
+  the ceiling is large and it is go. *Scope/risk:* research-scale (online-softmax
+  accumulation + ring scheduling + async-event plumbing + a multi-rank launch/golden
+  harness), and cross-*device* `TNOTIFY`/`TWAIT` ordering is far less forgiving than the
+  cross-core FFTS barriers used today. Tensor-parallel matmul + reduce-scatter/all-gather
+  fusion (Flux/Megatron-style, via `TPUT_ASYNC` into the collective) is a possible
+  follow-on but partially overlaps what HCCL already delivers — lower marginal value, not
+  the entry point. Note this is orthogonal to the single-node bottleneck: distribution
+  does not touch Phase C, so "Fused output permutation" above remains the higher-certainty
+  next win.
