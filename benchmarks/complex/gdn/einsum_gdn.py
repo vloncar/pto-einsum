@@ -8,7 +8,7 @@ def _safe_exp(x: torch.Tensor) -> torch.Tensor:
 class EinsumGDN:
     def __init__(self, dtype: torch.dtype):
         self.dtype = dtype
-        self.device = os.getenv("EINSUM_TEST_DEVICE", "cpu")
+        self.device = os.getenv("EINSUM_TEST_DEVICE", "npu")
 
     def _einsum(self, eq: str, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         """Two-operand contraction backend. Subclasses (e.g. the pto-einsum GDN)
