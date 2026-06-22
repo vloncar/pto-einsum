@@ -106,6 +106,13 @@ class EinsumBuilder:
         self.target_dir = None
         self._workspace = None  # persistent NPU workspace (lazily allocated in run)
         self._splitk = False    # split-K output needs zero-init (set in build())
+        # Operand-swap state (set in parse_equation). When the natural operand order
+        # keeps a Phase C transpose but the swapped order exposes a fusible/identity
+        # output, the recipe + codegen are built on the swapped operands and run()
+        # feeds the two input tensors in swapped order. input_shapes stays the public
+        # (user) order for validation; _exec_shapes is the order the kernel sees.
+        self._swap_operands = False
+        self._exec_shapes = tuple(input_shapes)
 
     def _validate_einsum_expr(self, fn: str, shape0: tuple[int, ...], shape1: tuple[int, ...]):
         inp, out = map(str.strip, fn.split('->'))
@@ -444,6 +451,33 @@ class EinsumBuilder:
             raise ValueError("Only exactly two input shapes are supported.")
         shape0, shape1 = self.input_shapes
         self.recipe = self.parse_recipe(self.equation, shape0, shape1)
+        self._exec_shapes = (shape0, shape1)
+
+        # Operand-swap to drop a Phase C transpose. A two-operand contraction is
+        # commutative (Σ_k in0·in1 == Σ_k in1·in0) and parse_recipe builds a correct
+        # recipe for either operand order, differing only in which free axis is the
+        # matmul's inner (N) dim. The Cube can store a tile straight into res (dropping
+        # Phase C, the second barrier and ws_res) only when the output's innermost axis
+        # is the *second* operand's free axis (free1 innermost) — see FusibleOutputPerm.
+        # So when the natural order leaves that axis on operand0 (free0 innermost, output
+        # kept on the Phase C path), feeding the operands swapped moves it to operand1
+        # and the fused store fires. Adopt the swap only when it turns a non-fusible,
+        # non-identity matmul output into a fusible (or identity) one, so it can never
+        # regress the identity-output or already-fusible fast paths, and never changes
+        # the result (out_shape is identical for either order).
+        r = self.recipe
+        is_matmul = not r['elementwise'] and not r['broadcast']
+        nat_identity = r['out_transpose_idxs'] == tuple(range(len(r['out_transpose_idxs'])))
+        swap_enabled = os.getenv("EINSUM_DISABLE_OPERAND_SWAP", "0") == "0"
+        if swap_enabled and is_matmul and not r['out_fusible'] and not nat_identity:
+            lhs, rhs = self.equation.split('->')
+            e0, e1 = lhs.split(',')
+            swapped = self.parse_recipe(f"{e1.strip()},{e0.strip()}->{rhs.strip()}", shape1, shape0)
+            sw_identity = swapped['out_transpose_idxs'] == tuple(range(len(swapped['out_transpose_idxs'])))
+            if swapped['out_fusible'] or sw_identity:
+                self.recipe = r = swapped
+                self._swap_operands = True
+                self._exec_shapes = (shape1, shape0)
 
         # Partial output tiles (a free dim not a multiple of the matmul tile) need the
         # operands padded up to a whole tile, which currently only has a single-batch
@@ -507,7 +541,7 @@ class EinsumBuilder:
             self.target_dir = os.path.join(self.build_base, self.code_hash)
             return
 
-        shape0, shape1 = self.input_shapes
+        shape0, shape1 = self._exec_shapes
         tpose_inp0_name = 'config_tpose_inp0'
         tpose_inp1_name = 'config_tpose_inp1'
         tpose_out_name = 'config_tpose_out'
@@ -707,6 +741,11 @@ class EinsumBuilder:
                 inp0 = inp0.contiguous()
             if not inp1.is_contiguous():
                 inp1 = inp1.contiguous()
+
+            # The recipe/codegen were built on _exec_shapes; when operands were swapped
+            # to expose a fusible output, feed the two tensors in that swapped order.
+            if self._swap_operands:
+                inp0, inp1 = inp1, inp0
 
             if self.device == "cpu":
                 output_tensor_npu = torch.zeros(self.recipe['out_shape'], dtype=torch.float32, device="cpu")

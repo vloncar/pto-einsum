@@ -30,7 +30,7 @@ class RefGDN:
     def cumsum(self, g: torch.Tensor, cs: int, cu_seqlens=None) -> torch.Tensor:
         """Chunk-local cumulative sum of gates (fp32)."""
         B, T, H = g.shape
-        gf = g.to(self.dtype).to(self.device)
+        gf = g.to(device=self.device, dtype=self.dtype)
         out = torch.zeros_like(gf, dtype=self.dtype)
         for bos, eos in _seq_ranges(T, cu_seqlens):
             for j in range(0, eos - bos, cs):
@@ -47,7 +47,7 @@ class RefGDN:
         """
         B, T, H, _ = A.shape
         out = torch.zeros(B, T, H, cs, dtype=self.dtype, device=self.device)
-        Af = A.to(self.dtype).to(self.device)
+        Af = A.to(device=self.device, dtype=self.dtype)
         if self.device != "cpu":
             # NPU: numpy/LAPACK is host-only. M = I + Ac is unit lower-triangular, so a
             # native batched triangular solve against I gives the same inverse per head.
@@ -85,8 +85,8 @@ class RefGDN:
         H = beta.shape[2]
         grp = H // Hg
         out = torch.zeros(B, T, H, cs, dtype=self.dtype, device=self.device)
-        kf, bf, gf = (k.to(self.dtype).to(self.device), beta.to(self.dtype).to(self.device),
-                      g_cumsum.to(self.dtype).to(self.device))
+        kf, bf, gf = (k.to(device=self.device, dtype=self.dtype), beta.to(device=self.device, dtype=self.dtype),
+                      g_cumsum.to(device=self.device, dtype=self.dtype))
         for bos, eos in _seq_ranges(T, cu_seqlens):
             for j in range(0, eos - bos, cs):
                 s, e = bos + j, min(bos + j + cs, eos)
@@ -118,10 +118,10 @@ class RefGDN:
         H = w.shape[2]
         grp = H // Hg
         kf, wf, uf, gf = (
-            k.to(self.dtype).to(self.device),
-            w.to(self.dtype).to(self.device),
-            u.to(self.dtype).to(self.device),
-            g_cumsum.to(self.dtype).to(self.device),
+            k.to(device=self.device, dtype=self.dtype),
+            w.to(device=self.device, dtype=self.dtype),
+            u.to(device=self.device, dtype=self.dtype),
+            g_cumsum.to(device=self.device, dtype=self.dtype),
         )
         ranges = _seq_ranges(T, cu_seqlens)
         tc = total_chunks(T, cs, cu_seqlens)
@@ -164,11 +164,11 @@ class RefGDN:
         w = torch.zeros(B, T, H, Kd, dtype=self.dtype, device=self.device)
         u = torch.zeros(B, T, H, v.shape[-1], dtype=self.dtype, device=self.device)
         kf, vf, bf, Af, gf = (
-            k.to(dtype=self.dtype).to(self.device),
-            v.to(dtype=self.dtype).to(self.device),
-            beta.to(dtype=self.dtype).to(self.device),
-            A_inv.to(dtype=self.dtype).to(self.device),
-            g_cumsum.to(dtype=self.dtype).to(self.device),
+            k.to(device=self.device, dtype=self.dtype),
+            v.to(device=self.device, dtype=self.dtype),
+            beta.to(device=self.device, dtype=self.dtype),
+            A_inv.to(device=self.device, dtype=self.dtype),
+            g_cumsum.to(device=self.device, dtype=self.dtype),
         )
         for bos, eos in _seq_ranges(T, cu_seqlens):
             for j in range(0, eos - bos, cs):
@@ -201,11 +201,11 @@ class RefGDN:
         H = v_new.shape[2]
         grp = H // Hg
         qf, kf, vf, hf, gf = (
-            q.to(self.dtype).to(self.device),
-            k.to(self.dtype).to(self.device),
-            v_new.to(self.dtype).to(self.device),
-            h_states.to(self.dtype).to(self.device),
-            g_cumsum.to(self.dtype).to(self.device),
+            q.to(device=self.device, dtype=self.dtype),
+            k.to(device=self.device, dtype=self.dtype),
+            v_new.to(device=self.device, dtype=self.dtype),
+            h_states.to(device=self.device, dtype=self.dtype),
+            g_cumsum.to(device=self.device, dtype=self.dtype),
         )
         o = torch.zeros(B, T, H, Dd, dtype=self.dtype, device=self.device)
         ranges = _seq_ranges(T, cu_seqlens)
@@ -246,7 +246,6 @@ class RefGDN:
         A = self.kkt(k, beta, g_sum, C, cu)
         A_inv = self.solve_tril(A, C, cu)
         w, u = self.wy_fast(k, v, beta, A_inv, g_sum, C, cu)
-        _, v_new, _ = self.chunk_h(k, w, u, g_sum, C, cu)
         h_states, v_new, _ = self.chunk_h(k, w, u, g_sum, C, cu)
         o = self.chunk_o(q, k, v_new, h_states, g_sum, C, cu)
         return o * scale

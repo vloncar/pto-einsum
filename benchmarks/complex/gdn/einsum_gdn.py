@@ -18,7 +18,7 @@ class EinsumGDN:
 
     def cumsum(self, g: torch.Tensor, cs: int, cu_seqlens=None) -> torch.Tensor:
         B, T, H = g.shape
-        gf = g.to(self.dtype).to(self.device)
+        gf = g.to(device=self.device, dtype=self.dtype)
         out = torch.zeros_like(gf)
         for bos, eos in seq_ranges(T, cu_seqlens):
             for j in range(0, eos - bos, cs):
@@ -38,9 +38,9 @@ class EinsumGDN:
         H = beta.shape[2]
         grp = H // Hg
         out = torch.zeros(B, T, H, cs, dtype=self.dtype, device=self.device)
-        kf = k.to(self.dtype).to(self.device)
-        bf = beta.to(self.dtype).to(self.device)
-        gf = g_cumsum.to(self.dtype).to(self.device)
+        kf = k.to(device=self.device, dtype=self.dtype)
+        bf = beta.to(device=self.device, dtype=self.dtype)
+        gf = g_cumsum.to(device=self.device, dtype=self.dtype)
         
         for bos, eos in seq_ranges(T, cu_seqlens):
             for j in range(0, eos - bos, cs):
@@ -52,21 +52,26 @@ class EinsumGDN:
                 
                 kc_exp = kc.repeat_interleave(grp, dim=2)
                 
-                qk = self._einsum("bihd, bjhd -> bijh", kc_exp, kc_exp)
-                diff_g = gc.unsqueeze(2) - gc.unsqueeze(1)
+                # Emit the contraction directly in [b, i, h, j] order (head h second,
+                # key-row j innermost) instead of [b, i, j, h]+permute. With j (=free1)
+                # innermost the einsum output is fusible, so the Cube stores each tile
+                # straight to `out` and drops the Phase C transpose; it also folds away
+                # the trailing .permute(0,1,3,2) the [b,i,j,h] formulation needed. The
+                # gate / beta / causal-mask factors are built in the same [b,i,h,j] order.
+                qk = self._einsum("bihd, bjhd -> bihj", kc_exp, kc_exp)
+                diff_g = gc.unsqueeze(-1) - gc.permute(0, 2, 1).unsqueeze(1)
                 exp_g = _safe_exp(diff_g)
-                
-                blk = qk * exp_g * bc.unsqueeze(2)
+
+                blk = qk * exp_g * bc.unsqueeze(-1)
                 mask = torch.arange(v, device=self.device)[:, None] > torch.arange(v, device=self.device)[None, :]
-                
-                masked_blk = blk * mask.unsqueeze(0).unsqueeze(-1)
-                out[:, s:e, :, :v] = masked_blk.permute(0, 1, 3, 2)
+
+                out[:, s:e, :, :v] = blk * mask[None, :, None, :]
         return out
 
     def solve_tril(self, A: torch.Tensor, cs: int, cu_seqlens=None) -> torch.Tensor:
         B, T, H, _ = A.shape
         out = torch.zeros(B, T, H, cs, dtype=self.dtype, device=self.device)
-        Af = A.to(self.dtype).to(self.device)
+        Af = A.to(device=self.device, dtype=self.dtype)
         for bos, eos in seq_ranges(T, cu_seqlens):
             for j in range(0, eos - bos, cs):
                 s, e = bos + j, min(bos + j + cs, eos)
@@ -104,11 +109,11 @@ class EinsumGDN:
         w = torch.zeros(B, T, H, Kd, dtype=self.dtype, device=self.device)
         u = torch.zeros(B, T, H, v.shape[-1], dtype=self.dtype, device=self.device)
         
-        kf = k.to(self.dtype).to(self.device)
-        vf = v.to(self.dtype).to(self.device)
-        bf = beta.to(self.dtype).to(self.device)
-        Af = A_inv.to(self.dtype).to(self.device)
-        gf = g_cumsum.to(self.dtype).to(self.device)
+        kf = k.to(device=self.device, dtype=self.dtype)
+        vf = v.to(device=self.device, dtype=self.dtype)
+        bf = beta.to(device=self.device, dtype=self.dtype)
+        Af = A_inv.to(device=self.device, dtype=self.dtype)
+        gf = g_cumsum.to(device=self.device, dtype=self.dtype)
         
         for bos, eos in seq_ranges(T, cu_seqlens):
             for j in range(0, eos - bos, cs):
@@ -145,10 +150,10 @@ class EinsumGDN:
         H = w.shape[2]
         grp = H // Hg
         
-        kf = k.to(self.dtype).to(self.device)
-        wf = w.to(self.dtype).to(self.device)
-        uf = u.to(self.dtype).to(self.device)
-        gf = g_cumsum.to(self.dtype).to(self.device)
+        kf = k.to(device=self.device, dtype=self.dtype)
+        wf = w.to(device=self.device, dtype=self.dtype)
+        uf = u.to(device=self.device, dtype=self.dtype)
+        gf = g_cumsum.to(device=self.device, dtype=self.dtype)
         
         ranges = seq_ranges(T, cu_seqlens)
         tc = total_chunks(T, cs, cu_seqlens)
@@ -204,11 +209,11 @@ class EinsumGDN:
         H = v_new.shape[2]
         grp = H // Hg
         
-        qf = q.to(self.dtype).to(self.device)
-        kf = k.to(self.dtype).to(self.device)
-        vf = v_new.to(self.dtype).to(self.device)
-        hf = h_states.to(self.dtype).to(self.device)
-        gf = g_cumsum.to(self.dtype).to(self.device)
+        qf = q.to(device=self.device, dtype=self.dtype)
+        kf = k.to(device=self.device, dtype=self.dtype)
+        vf = v_new.to(device=self.device, dtype=self.dtype)
+        hf = h_states.to(device=self.device, dtype=self.dtype)
+        gf = g_cumsum.to(device=self.device, dtype=self.dtype)
         
         o = torch.zeros(B, T, H, Dd, dtype=self.dtype, device=self.device)
         ranges = seq_ranges(T, cu_seqlens)
@@ -258,7 +263,6 @@ class EinsumGDN:
         A = self.kkt(k, beta, g_sum, C, cu)
         A_inv = self.solve_tril(A, C, cu)
         w, u = self.wy_fast(k, v, beta, A_inv, g_sum, C, cu)
-        _, v_new, _ = self.chunk_h(k, w, u, g_sum, C, cu)
         h_states, v_new, _ = self.chunk_h(k, w, u, g_sum, C, cu)
         o = self.chunk_o(q, k, v_new, h_states, g_sum, C, cu)
         return o * scale
