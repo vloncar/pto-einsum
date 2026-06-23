@@ -50,9 +50,8 @@ from mega_gdn import MegaGDN
 C = 128
 D = 128
 STAGES = ["cumsum", "kkt", "solve_tril", "wy_fast", "chunk_h", "chunk_o"]
-IMPLS = ["torch_ref", "torch_einsum", "pto_einsum", "megagdn"]
+IMPLS = ["torch_einsum", "pto_einsum", "megagdn"]
 IMPL_LABELS = {
-    "torch_ref": "torch ref",
     "torch_einsum": "torch einsum",
     "pto_einsum": "pto-einsum",
     "megagdn": "megagdn-pto",
@@ -100,7 +99,7 @@ def frob_rel(actual, expected):
 # ---------------------------------------------------------------------------
 # Per-config measurement
 # ---------------------------------------------------------------------------
-def measure_config(n_seq, l_seg, H, Hg, einsum_gdn, pto_gdn, ref_iters):
+def measure_config(n_seq, l_seg, H, Hg, einsum_gdn, pto_gdn):
     dev = "npu:0"
     T = n_seq * l_seg
     scale = D ** -0.5
@@ -137,14 +136,12 @@ def measure_config(n_seq, l_seg, H, Hg, einsum_gdn, pto_gdn, ref_iters):
 
     # 1-3: torch-family
     for name, impl, iters in [
-        ("torch_ref", ref, ref_iters),
         ("torch_einsum", einsum_gdn, 10),
         ("pto_einsum", pto_gdn, 10),
     ]:
         cl = torch_family_closures(impl)
         for st in STAGES:
-            times[name][st] = bench_npu(cl[st], warmup=2 if name == "torch_ref" else 3,
-                                        iters=iters)
+            times[name][st] = bench_npu(cl[st], 3, iters=iters)
         out = impl.run_full_pipeline(q, k, v, g_in, beta, cu_list, H, Hg, scale, C=C)
         errs[name] = frob_rel(out, golden)
         torch.npu.synchronize()
@@ -163,7 +160,8 @@ def measure_config(n_seq, l_seg, H, Hg, einsum_gdn, pto_gdn, ref_iters):
     for st in STAGES:
         times["megagdn"][st] = bench_npu(getattr(mega, st), warmup=3, iters=15)
 
-    return times, errs, T
+    peak_gib = torch.npu.max_memory_allocated() / 2**30
+    return times, errs, T, peak_gib
 
 
 # ---------------------------------------------------------------------------
@@ -230,8 +228,11 @@ def main():
                     help="Comma list of NxL (N_seq x L_seg), e.g. 1x512,2x1024.")
     ap.add_argument("--H", type=int, default=32, help="Value head count.")
     ap.add_argument("--hg", type=int, default=16, help="Key head count Hg.")
-    ap.add_argument("--ref-iters", type=int, default=3,
-                    help="Timed iters for the (slow) torch reference.")
+    ap.add_argument("--batch-cap", type=int, default=64,
+                    help="Max chunks folded into one batched einsum in the torch/pto "
+                         "GDN stages. Caps peak transient memory at large T (the chunk "
+                         "fold materialises ~cap chunks of O(C^2*H) intermediates at "
+                         "once). 0 = unbounded (fold all nc chunks; OOMs at large T).")
     ap.add_argument("--out-dir", default=os.path.dirname(os.path.abspath(__file__)))
     args = ap.parse_args()
 
@@ -243,18 +244,21 @@ def main():
 
     einsum_gdn = EinsumGDN(torch.float32); einsum_gdn.device = args.device
     pto_gdn = PtoGDN(torch.float32); pto_gdn.device = args.device
+    einsum_gdn.batch_cap = pto_gdn.batch_cap = args.batch_cap
 
     results, all_errs = {}, {}
     print(f"Workloads: {configs}   H={H} Hg={Hg} D={D} C={C}")
     print("=" * 78)
+    print(f"batch_cap={args.batch_cap} (chunks/fold; caps peak transient at large T)")
     for (n, l) in configs:
         torch.npu.synchronize()
         torch.npu.empty_cache()
+        torch.npu.reset_peak_memory_stats()
         t0 = time.perf_counter()
-        times, errs, T = measure_config(n, l, H, Hg, einsum_gdn, pto_gdn, args.ref_iters)
+        times, errs, T, peak_gib = measure_config(n, l, H, Hg, einsum_gdn, pto_gdn)
         results[(n, l)] = times
         all_errs[(n, l)] = errs
-        print(f"\nN={n} L={l} (T={T})   [{time.perf_counter()-t0:.1f}s]")
+        print(f"\nN={n} L={l} (T={T})   [{time.perf_counter()-t0:.1f}s]   peak NPU mem {peak_gib:.1f} GiB")
         hdr = "stage".ljust(12) + "".join(IMPL_LABELS[i].rjust(14) for i in IMPLS)
         print(hdr)
         for st in STAGES:

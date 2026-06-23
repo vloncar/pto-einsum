@@ -42,7 +42,6 @@ class MegaGDN:
 
     def __init__(self, q, k, v, g_in, beta, cu_seqlens, H, Hg, scale):
         self.dev = q.device
-        self.stream = torch.npu.current_stream()._as_parameter_
         self.H, self.Hg, self.scale = H, Hg, scale
         self.T = q.shape[1]
         self.cu = cu_seqlens.to(torch.int32) if cu_seqlens is not None else \
@@ -79,7 +78,7 @@ class MegaGDN:
 
     # --- individual stages (each a single kernel launch, in-place into buffers) ---
     def cumsum(self):
-        run_chunk_cumsum(self.g_in, self.g_sum, stream=self.stream, chunk_size=C,
+        run_chunk_cumsum(self.g_in, self.g_sum, chunk_size=C,
                          cu_seqlens=self.cu, batch_size_override=self.N_seq)
         # Gate transposes feed kkt/wy/h/o; recompute here so cumsum output is consistent.
         self.g_t = transpose_gates(self.g_sum)
@@ -87,7 +86,7 @@ class MegaGDN:
 
     def kkt(self):
         run_scaled_dot_kkt(self.k, self.beta, self.g_sum, self.msk_l, self.A,
-                           stream=self.stream, g_t=self.g_t, beta_t=self.beta_t,
+                           g_t=self.g_t, beta_t=self.beta_t,
                            chunk_size=C, cu_seqlens=self.cu,
                            batch_size_override=self.N_seq, key_heads=self.Hg)
 
@@ -96,17 +95,17 @@ class MegaGDN:
 
     def wy_fast(self):
         run_wy_fast(self.k, self.v, self.beta, self.g_sum, self.A_inv, self.w, self.u,
-                    stream=self.stream, g_t=self.g_t, beta_t=self.beta_t, chunk_size=C,
+                    g_t=self.g_t, beta_t=self.beta_t, chunk_size=C,
                     cu_seqlens=self.cu, batch_size_override=self.N_seq, key_heads=self.Hg)
 
     def chunk_h(self):
         run_chunk_h(self.k, self.w, self.u, self.g_sum, self.s, self.v_new, self.fs,
-                    stream=self.stream, g_t=self.g_t, chunk_size=C, cu_seqlens=self.cu,
+                    g_t=self.g_t, chunk_size=C, cu_seqlens=self.cu,
                     batch_size_override=self.N_seq, key_heads=self.Hg)
 
     def chunk_o(self):
         run_chunk_o(self.q, self.k, self.v_new, self.s, self.g_sum, self.msk_f, self.o,
-                    stream=self.stream, g_t=self.g_t, chunk_size=C, cu_seqlens=self.cu,
+                    g_t=self.g_t, chunk_size=C, cu_seqlens=self.cu,
                     batch_size_override=self.N_seq, key_heads=self.Hg)
 
     def run_full_pipeline(self):
