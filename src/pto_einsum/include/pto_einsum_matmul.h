@@ -269,6 +269,74 @@ AICORE inline constexpr unsigned deep_pick_kd(unsigned Mt, unsigned Nt, unsigned
     return Kq;
 }
 
+// Cross-tile pipelining predicate (+ the granularities it keys on). The deep
+// per-tile schedule (matmul_one_tile_deep) hides the big GM->L1 load behind compute
+// only via its *within-tile* chunk prefetch (the `c+1 < nKd` arm). When nKd==1 —
+// small K, e.g. the 128x128x128 GEMMs a batched attention / GDN contraction
+// decomposes into — that prefetch never fires, so every tile's GM->L1 load (MTE2)
+// and fixpipe store (FIX) run fully exposed and the cube idles (~15% of HBM,
+// latency-bound, not bandwidth-bound). matmul_tile_loop_pipelined recovers this by
+// overlapping ACROSS the tile boundary instead. This gates that path on:
+//   * single-chunk tiles (nKd==1) — the only regime with no within-tile pipeline;
+//   * all tiles full (!A_PADDED && !B_PADDED) — so the valid extents are
+//     loop-invariant and can be set once (partial-tile nKd==1 keeps the per-tile
+//     deep path; it is uncommon and not the batched-tiny target);
+//   * the two ping-pong accumulators fit L0C (128 KB);
+//   * enough tiles to amortize the prologue/epilogue.
+template <typename data_T, typename CONFIG_T>
+struct MatmulPipeline {
+    using G = MatmulGeom<CONFIG_T>;
+    static constexpr unsigned ds  = sizeof(data_T);
+    static constexpr unsigned Kq  = deep_pick_kq(G::Mt, G::Nt, G::K, ds);
+    static constexpr unsigned Kd  = deep_pick_kd(G::Mt, G::Nt, G::K, Kq, ds);
+    static constexpr unsigned nKd = G::K / Kd;
+    static constexpr unsigned MIN_TILES = 32u;
+    // The L0C term below bounds the accumulator ping-pong; the matmul_tile_loop_pipelined
+    // body's L1/L0A/L0B capacity static_asserts are implied by the same deep_pick_kq/kd
+    // (Kq fits 64 KB L0, Kd fits 512 KB CBUF by construction), so this gate is a
+    // sufficient precondition for the routed function -- a future granularity change that
+    // broke an invariant would be a loud compile error there, never a silent miscompute.
+    static constexpr bool PIPELINE_TILES =
+        (nKd == 1u) && !G::A_PADDED && !G::B_PADDED &&
+        (2u * G::Mt * G::Nt * sizeof(float) <= 128u * 1024u) &&
+        (G::total_tiles >= MIN_TILES);
+};
+
+// Compile-time gate self-test (Phase 2 hardening). The cross-tile loop's win is
+// invisible to a correctness check (the deep per-tile path is also correct), so a
+// future change to deep_pick_kq/kd, MatmulGeom, or the predicate could silently stop
+// routing the batched-tiny regime through it with no test failing. These static_asserts
+// pin the gate's decision on canonical shapes so any such drift breaks the build loudly.
+// Cost is nil: pure constexpr, evaluated once per translation unit, emits no code.
+namespace gate_selftest {
+template <unsigned F0, unsigned F1, unsigned Cn, unsigned I, unsigned T>
+struct Cfg {
+    static constexpr unsigned n_free0 = F0;
+    static constexpr unsigned n_free1 = F1;
+    static constexpr unsigned n_contract = Cn;
+    static constexpr unsigned n_inplace = I;
+    static constexpr unsigned tile_m = T;
+    static constexpr unsigned tile_n = T;
+    static constexpr unsigned tile_k = T;
+};
+// Target regime: full 128^3 tiles, many batches -> route to the cross-tile loop.
+static_assert(MatmulPipeline<float, Cfg<128, 128, 128, 2048, 128>>::PIPELINE_TILES,
+              "gate regression: fp32 128^3 batched-tiny must pipeline (nKd==1, full tiles, >=32 tiles)");
+static_assert(MatmulPipeline<half, Cfg<128, 128, 128, 2048, 128>>::PIPELINE_TILES,
+              "gate regression: fp16 128^3 batched-tiny must pipeline");
+// Just past the tile floor (32 == MIN_TILES) still fires; one below does not.
+static_assert(MatmulPipeline<float, Cfg<128, 128, 64, 32, 128>>::PIPELINE_TILES,
+              "gate regression: total_tiles==MIN_TILES must pipeline");
+static_assert(!MatmulPipeline<float, Cfg<128, 128, 128, 1, 128>>::PIPELINE_TILES,
+              "gate regression: a single tile must NOT pipeline (prologue/epilogue unamortized)");
+// Large K -> the deep tile's within-tile prefetch already fires (nKd>1); stay on it.
+static_assert(!MatmulPipeline<float, Cfg<128, 128, 512, 2048, 128>>::PIPELINE_TILES,
+              "gate regression: large-K (nKd>1) must NOT take the cross-tile loop");
+// Partial tile (free dim not a whole-tile multiple) -> per-tile path keeps the clamps.
+static_assert(!MatmulPipeline<float, Cfg<200, 128, 128, 64, 128>>::PIPELINE_TILES,
+              "gate regression: partial-tile (A_PADDED) must NOT pipeline");
+} // namespace gate_selftest
+
 // One output tile, deep-pipelined — the compute schedule from the pto-kernels
 // matmul-swizzle example, ported and generalized to fp32/fp16 and the einsum's
 // padded/batched shapes (the example's L2 tile-swizzle was not kept — it measured a
@@ -478,6 +546,221 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
         wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 }
 
+// Cross-tile software-pipelined schedule for the nKd==1 regime (gated by
+// MatmulPipeline::PIPELINE_TILES). Each tile is a single GM->L1 chunk, so
+// matmul_one_tile_deep's within-tile prefetch never fires and its GM->L1 load and
+// fixpipe store are fully exposed per tile. This loop pipelines across the tile
+// boundary instead: it prefetches tile t+1's GM->L1 load (MTE2) and lets tile t-1's
+// fixpipe store (FIX) drain under tile t's compute (M). L1 A/B operands ping-pong
+// across two buffers (a_l1/b_l1[2]) and the L0C accumulator ping-pongs across two
+// (c_l0[2], the two that fit L0C); flags are drained once at loop exit instead of
+// per tile. All tiles are full (PIPELINE_TILES requires !A_PADDED && !B_PADDED), so
+// validM==Mt / validN==Nt are loop-invariant and the valid extents are set once.
+//
+// Event namespaces (each (producer,consumer) pipe pair is an independent ID space),
+// keyed by L1-buffer parity q (A->ID0/ID1, B->ID2/ID3) and accumulator parity:
+//   MTE1->MTE2  L1 buffer free (WAR: a load waits the extract that drained it)
+//   MTE2->MTE1  GM->L1 load done (RAW: compute waits its load)
+//   M->MTE1     L0 ping-pong free (WAR: an extract waits the matmul that used it)
+//   MTE1->M     extract done (RAW: matmul waits its extract) -- ID0, set/wait adjacent
+//   M->FIX      matmul done (RAW: the store waits this tile's matmuls)
+//   FIX->M      accumulator free (WAR: tile t+2 reuses c_l0[q] after t's store)
+template <typename data_T, typename CONFIG_T, bool FUSE_OUT = false>
+AICORE inline void matmul_tile_loop_pipelined(__gm__ const data_T* ws0, __gm__ const data_T* ws1,
+                                              __gm__ float* ws_res, unsigned start, unsigned end) {
+        using G = MatmulGeom<CONFIG_T>;
+        using P = MatmulPipeline<data_T, CONFIG_T>;
+        constexpr unsigned L0 = G::L0;
+        constexpr unsigned L1 = G::L1;
+        constexpr unsigned K  = G::K;
+        constexpr unsigned Mt = G::Mt;
+        constexpr unsigned Nt = G::Nt;
+        constexpr unsigned nN = G::nN;
+        constexpr unsigned tiles_per_batch = G::tiles_per_batch;
+        constexpr unsigned Arows = G::Arows;
+        constexpr unsigned Bcols = G::Bcols;
+
+        using FOut = FusibleOutputPerm<CONFIG_T>;
+        constexpr unsigned ROW_STRIDE = FUSE_OUT ? FOut::row_stride : L1;
+
+        constexpr unsigned ds  = sizeof(data_T);
+        constexpr unsigned Kq  = P::Kq;
+        constexpr unsigned Kd  = P::Kd;     // == K (nKd==1)
+        constexpr unsigned nP  = Kd / Kq;   // L0 compute phases per tile
+        static_assert(P::nKd == 1u, "pipelined tile loop requires single-chunk (nKd==1) tiles");
+
+        if (start >= end) return;
+
+        using ShapeA = pto::Shape<1, 1, 1, -1, Kd>;
+        using StrideA = pto::Stride<1, 1, 1, K, 1>;
+        using ShapeB = pto::Shape<1, 1, 1, Kd, -1>;
+        using StrideB = pto::Stride<1, 1, 1, Bcols, 1>;
+        using ShapeC = pto::Shape<1, 1, 1, -1, -1>;
+        using StrideC = pto::Stride<1, 1, 1, ROW_STRIDE, 1>;
+        using MatTileA = pto::Tile<pto::TileType::Mat, data_T, Mt, Kd, pto::BLayout::ColMajor, -1, -1, pto::SLayout::RowMajor, 512>;
+        using MatTileB = pto::Tile<pto::TileType::Mat, data_T, Kd, Nt, pto::BLayout::ColMajor, -1, -1, pto::SLayout::RowMajor, 512>;
+        using LeftTileA = pto::TileLeft<data_T, Mt, Kq, -1, -1>;
+        using RightTileB = pto::TileRight<data_T, Kq, Nt, -1, -1>;
+        using AccTileC = pto::TileAcc<float, Mt, Nt, -1, -1>;
+
+        constexpr unsigned matBytesA = Mt * Kd * ds;
+        constexpr unsigned matBytesB = Kd * Nt * ds;
+        static_assert(2 * matBytesA + 2 * matBytesB <= 512u * 1024u,
+                      "Pipelined L1 A/B ping-pong exceeds the 512 KB CBUF.");
+        constexpr unsigned l0aBytes = Mt * Kq * ds;
+        constexpr unsigned l0bBytes = Kq * Nt * ds;
+        static_assert(2 * l0aBytes <= 64u * 1024u, "Pipelined L0A ping-pong exceeds L0A.");
+        static_assert(2 * l0bBytes <= 64u * 1024u, "Pipelined L0B ping-pong exceeds L0B.");
+        constexpr unsigned accBytes = Mt * Nt * sizeof(float);
+        static_assert(2 * accBytes <= 128u * 1024u, "Pipelined L0C accumulator ping-pong exceeds L0C.");
+
+        MatTileA a_l1[2];
+        MatTileB b_l1[2];
+        LeftTileA a_l0[2];
+        RightTileB b_l0[2];
+        AccTileC c_l0[2];
+        TASSIGN(a_l1[0], 0);
+        TASSIGN(a_l1[1], matBytesA);
+        TASSIGN(b_l1[0], 2 * matBytesA);
+        TASSIGN(b_l1[1], 2 * matBytesA + matBytesB);
+        TASSIGN(a_l0[0], 0);
+        TASSIGN(a_l0[1], l0aBytes);
+        TASSIGN(b_l0[0], 0);
+        TASSIGN(b_l0[1], l0bBytes);
+        TASSIGN(c_l0[0], 0);
+        TASSIGN(c_l0[1], accBytes);
+
+        // Full tiles (PIPELINE_TILES gate): every tile's valid extents are identical,
+        // so set them once. Operands load the full tile so the ND->NZ packing has no
+        // empty fractal block.
+        a_l1[0].SetValidRow(Mt); a_l1[0].SetValidCol(Kd);
+        a_l1[1].SetValidRow(Mt); a_l1[1].SetValidCol(Kd);
+        b_l1[0].SetValidRow(Kd); b_l1[0].SetValidCol(Nt);
+        b_l1[1].SetValidRow(Kd); b_l1[1].SetValidCol(Nt);
+        a_l0[0].SetValidRow(Mt); a_l0[0].SetValidCol(Kq);
+        a_l0[1].SetValidRow(Mt); a_l0[1].SetValidCol(Kq);
+        b_l0[0].SetValidRow(Kq); b_l0[0].SetValidCol(Nt);
+        b_l0[1].SetValidRow(Kq); b_l0[1].SetValidCol(Nt);
+        c_l0[0].SetValidRow(Mt); c_l0[0].SetValidCol(Nt);
+        c_l0[1].SetValidRow(Mt); c_l0[1].SetValidCol(Nt);
+
+        // Init: both L1 A/B buffers free, both L0 ping-pong buffers free, both
+        // accumulators free (primes the WAR flags the first iterations wait on).
+        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);   // a_l1[0] free
+        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);   // a_l1[1] free
+        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);   // b_l1[0] free
+        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);   // b_l1[1] free
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);      // a_l0[0]/b_l0[0] free
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);      // a_l0[1]/b_l0[1] free
+        set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);       // c_l0[0] free
+        set_flag(PIPE_FIX, PIPE_M, EVENT_ID1);       // c_l0[1] free
+
+        // Prologue: load tile `start` into its L1 buffer (parity start&1).
+        {
+            unsigned t = start, q = t & 1;
+            unsigned i = t / tiles_per_batch, rem = t % tiles_per_batch;
+            unsigned row0 = (rem / nN) * Mt, col0 = (rem % nN) * Nt;
+            const __gm__ data_T* aBase = ws0 + i * Arows * K + row0 * K;
+            const __gm__ data_T* bBase = ws1 + i * K * Bcols + col0;
+            event_t aF = q ? EVENT_ID1 : EVENT_ID0;
+            event_t bF = q ? EVENT_ID3 : EVENT_ID2;
+            pto::GlobalTensor<data_T, ShapeA, StrideA> ag(const_cast<__gm__ data_T*>(aBase), ShapeA(Mt));
+            pto::GlobalTensor<data_T, ShapeB, StrideB> bg(const_cast<__gm__ data_T*>(bBase), ShapeB(Nt));
+            wait_flag(PIPE_MTE1, PIPE_MTE2, aF);
+            TLOAD(a_l1[q], ag);
+            set_flag(PIPE_MTE2, PIPE_MTE1, aF);
+            wait_flag(PIPE_MTE1, PIPE_MTE2, bF);
+            TLOAD(b_l1[q], bg);
+            set_flag(PIPE_MTE2, PIPE_MTE1, bF);
+        }
+
+        unsigned gphase = 0;
+        for (unsigned t = start; t < end; t++) {
+            unsigned q = t & 1;
+            // Prefetch tile t+1 into the other L1 buffer (overlaps this tile's compute).
+            if (t + 1 < end) {
+                unsigned tn = t + 1, qn = tn & 1;
+                unsigned i = tn / tiles_per_batch, rem = tn % tiles_per_batch;
+                unsigned row0 = (rem / nN) * Mt, col0 = (rem % nN) * Nt;
+                const __gm__ data_T* aBase = ws0 + i * Arows * K + row0 * K;
+                const __gm__ data_T* bBase = ws1 + i * K * Bcols + col0;
+                event_t aF = qn ? EVENT_ID1 : EVENT_ID0;
+                event_t bF = qn ? EVENT_ID3 : EVENT_ID2;
+                pto::GlobalTensor<data_T, ShapeA, StrideA> ag(const_cast<__gm__ data_T*>(aBase), ShapeA(Mt));
+                pto::GlobalTensor<data_T, ShapeB, StrideB> bg(const_cast<__gm__ data_T*>(bBase), ShapeB(Nt));
+                wait_flag(PIPE_MTE1, PIPE_MTE2, aF);
+                TLOAD(a_l1[qn], ag);
+                set_flag(PIPE_MTE2, PIPE_MTE1, aF);
+                wait_flag(PIPE_MTE1, PIPE_MTE2, bF);
+                TLOAD(b_l1[qn], bg);
+                set_flag(PIPE_MTE2, PIPE_MTE1, bF);
+            }
+
+            // Compute tile t from L1 buffer q into accumulator c_l0[q].
+            event_t aLd = q ? EVENT_ID1 : EVENT_ID0;
+            event_t bLd = q ? EVENT_ID3 : EVENT_ID2;
+            event_t acc = q ? EVENT_ID1 : EVENT_ID0;
+            wait_flag(PIPE_MTE2, PIPE_MTE1, aLd);   // this tile's GM->L1 load done
+            wait_flag(PIPE_MTE2, PIPE_MTE1, bLd);
+            wait_flag(PIPE_FIX, PIPE_M, acc);       // c_l0[q] free (tile t-2 stored)
+
+            for (unsigned p = 0; p < nP; p++) {
+                unsigned pp = gphase & 1;
+                event_t l0f = pp ? EVENT_ID1 : EVENT_ID0;
+                wait_flag(PIPE_M, PIPE_MTE1, l0f);          // a_l0[pp]/b_l0[pp] free
+                TEXTRACT(a_l0[pp], a_l1[q], 0, p * Kq);
+                TEXTRACT(b_l0[pp], b_l1[q], p * Kq, 0);
+                if (p == nP - 1) {                           // last extract frees this L1 buffer
+                    set_flag(PIPE_MTE1, PIPE_MTE2, aLd);
+                    set_flag(PIPE_MTE1, PIPE_MTE2, bLd);
+                }
+                set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);      // RAW: matmul waits its extract
+                wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+                if (p == 0)
+                    TMATMUL(c_l0[q], a_l0[pp], b_l0[pp]);
+                else
+                    TMATMUL_ACC(c_l0[q], a_l0[pp], b_l0[pp]);
+                set_flag(PIPE_M, PIPE_MTE1, l0f);            // a_l0[pp]/b_l0[pp] free
+                gphase++;
+            }
+
+            // Store accumulator c_l0[q] -> GM. The FIX store is issued but NOT waited
+            // here; it drains under the next tiles' compute, and tile t+2 (or the
+            // epilogue drain) waits the FIX->M free before reusing c_l0[q].
+            set_flag(PIPE_M, PIPE_FIX, acc);    // RAW: store waits this tile's matmuls
+            wait_flag(PIPE_M, PIPE_FIX, acc);
+            unsigned i = t / tiles_per_batch, rem = t % tiles_per_batch;
+            unsigned row0 = (rem / nN) * Mt, col0 = (rem % nN) * Nt;
+            unsigned base;
+            if constexpr (FUSE_OUT) {
+                base = row0 * ROW_STRIDE + col0;
+                unsigned rr = i;
+                #pragma unroll
+                for (int k = int(FOut::n_batch) - 1; k >= 0; --k) {
+                    base += (rr % CONFIG_T::out_batch_sizes[k]) * CONFIG_T::out_batch_strides[k];
+                    rr /= CONFIG_T::out_batch_sizes[k];
+                }
+            } else {
+                base = i * L0 * L1 + row0 * L1 + col0;
+            }
+            pto::GlobalTensor<float, ShapeC, StrideC> cg(ws_res + base, ShapeC(Mt, Nt));
+            TSTORE(cg, c_l0[q]);
+            set_flag(PIPE_FIX, PIPE_M, acc);    // WAR: c_l0[q] free for tile t+2 / drain
+        }
+
+        // Drain the WAR-free flags the tail iterations set but nothing consumed (both
+        // L1 A/B buffers, both L0 buffers, both accumulators) so no flag state leaks
+        // and both in-flight fixpipe stores complete before returning.
+        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+        wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+        wait_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+}
+
 // Factored out so the standalone kernel and the fused kernel share it; the caller
 // guards with `if constexpr (DAV_CUBE)` and supplies the block index/count.
 // SPLITK enables the split-K schedule (see batched_matmul_inline body); it is off
@@ -526,14 +809,20 @@ AICORE inline void batched_matmul_inline(__gm__ const data_T* ws0, __gm__ const 
         }
 
         // Plain schedule: block-distribute the output tiles (one contiguous chunk per
-        // core), full K per tile via the deep-pipelined tile. (An L2 tile-swizzle was
-        // tried here and removed — measured a no-op on square grids, HBM-bound, and a
-        // regression on non-square ones.)
+        // core), full K per tile. (An L2 tile-swizzle was tried here and removed —
+        // measured a no-op on square grids, HBM-bound, and a regression on non-square
+        // ones.) For the nKd==1 batched-tiny regime the deep tile's within-tile
+        // prefetch is dead (load/store fully exposed, latency-bound), so route to the
+        // cross-tile pipelined loop; everything else keeps the per-tile deep path.
         unsigned chunk = (total_tiles + block_num - 1) / block_num;
         unsigned start = block_idx * chunk;
         unsigned end = (start + chunk) < total_tiles ? (start + chunk) : total_tiles;
-        for (unsigned t = start; t < end; t++) {
-            matmul_one_tile_deep<data_T, CONFIG_T, FUSE_OUT>(ws0, ws1, ws_res, t);
+        if constexpr (MatmulPipeline<data_T, CONFIG_T>::PIPELINE_TILES) {
+            matmul_tile_loop_pipelined<data_T, CONFIG_T, FUSE_OUT>(ws0, ws1, ws_res, start, end);
+        } else {
+            for (unsigned t = start; t < end; t++) {
+                matmul_one_tile_deep<data_T, CONFIG_T, FUSE_OUT>(ws0, ws1, ws_res, t);
+            }
         }
 }
 

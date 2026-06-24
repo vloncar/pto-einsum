@@ -86,6 +86,27 @@ BENCHMARKS = {
         "sizes": [8, 16, 32, 64, 128],
         "make": lambda b: ((b, 64, 128), (b, 128, 64), str(b)),
     },
+    # Batched-tiny full 128^3 tiles (nKd==1) -- the latency-bound regime the cross-tile
+    # pipelined loop targets. The batch sweep straddles MIN_TILES (32): below it the deep
+    # per-tile path runs, at/above it the pipelined loop kicks in, so the curve tracks
+    # the win turning on and guards against it silently regressing vs torch.
+    "batch-matmul-tiny": {
+        "name": "Batch MatMul (tiny 128^3)",
+        "equation": "bij, bjk -> bik",
+        "dtype": torch.float32,
+        "param": "Batch (128x128 @ 128x128)",
+        "sizes": [16, 32, 64, 128, 256],
+        "make": lambda b: ((b, 128, 128), (b, 128, 128), str(b)),
+    },
+    # Same batched-tiny regime in float16 (fp16 matmul, fp32 accumulate).
+    "batch-matmul-tiny-fp16": {
+        "name": "Batch MatMul (tiny 128^3, fp16)",
+        "equation": "bij, bjk -> bik",
+        "dtype": torch.float16,
+        "param": "Batch (128x128 @ 128x128)",
+        "sizes": [16, 32, 64, 128, 256],
+        "make": lambda b: ((b, 128, 128), (b, 128, 128), str(b)),
+    },
     # Multi-index contraction collapsing two axes, swept by contraction depth.
     "contraction": {
         "name": "Tensor Contraction",

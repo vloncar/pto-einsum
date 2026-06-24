@@ -65,6 +65,12 @@ from pto_einsum import einsum, EinsumBuilder
     ("bij, bjk -> bik", (32, 16, 32), (32, 32, 64)),
     # batched with transposed per-batch input block (batched 2D transpose), I > 20
     ("bji, bjk -> bik", (24, 32, 16), (24, 32, 64)),
+    # batched-tiny 128^3: full tiles, nKd==1, total_tiles(=64) >= MIN_TILES -> the
+    # cross-tile pipelined loop (matmul_tile_loop_pipelined). Identity output.
+    ("bij, bjk -> bik", (64, 128, 128), (64, 128, 128)),
+    # same regime with a fused output permutation: batch (b,h)=2*16=32 tiles, free0/free1
+    # full 128 tiles, contract d=64 -> nKd==1 -> pipelined loop with FUSE_OUT.
+    ("bshd, bthd -> bsht", (2, 128, 16, 64), (2, 128, 16, 64)),
 
     # --- non-16-aligned contraction (K != C): K-padded transpose destinations ---
     # j=20 -> K=32: identity-copy inputs (ij,jk) and a=20 -> K=32: 2D-TTRANS (ai,ja).
@@ -210,6 +216,37 @@ def test_builder_reuse_kneqc():
         result = runner(inp0, inp1)
         expected = torch.einsum(equation, inp0, inp1)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_pipelined_matmul_deterministic(dtype):
+    # The cross-tile pipelined loop (matmul_tile_loop_pipelined) double-buffers L1
+    # operands and ping-pongs the L0C accumulator across tile boundaries with a
+    # non-blocking store. An earlier cross-tile design raced (needed a PIPE_ALL
+    # barrier); this one is meant to be race-free. A data race would surface as
+    # run-to-run variation on identical input, so pin bit-exact determinism here --
+    # this is the guard that the WAR/RAW flag ordering stays correct under codegen
+    # changes. 128^3 batched (64 tiles) is squarely in the pipelined regime.
+    if TEST_DEVICE == "cpu":
+        pytest.skip("pipelined Cube path is NPU-only")
+
+    equation = "bij, bjk -> bik"
+    shape0, shape1 = (64, 128, 128), (64, 128, 128)
+    runner = EinsumBuilder(equation, [shape0, shape1], dtype, device=TEST_DEVICE).build()
+
+    inp0 = torch.rand(shape0, dtype=dtype, device=TEST_DEVICE)
+    inp1 = torch.rand(shape1, dtype=dtype, device=TEST_DEVICE)
+
+    ref = runner(inp0, inp1).clone()
+    # Also pin correctness so a deterministic-but-wrong result can't pass silently.
+    expected = torch.einsum(equation, inp0, inp1).to(dtype=torch.float32)
+    rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
+    torch.testing.assert_close(ref, expected, rtol=rtol, atol=atol)
+
+    for _ in range(8):
+        out = runner(inp0, inp1)
+        # Bit-exact: same kernel, same input -> identical output, every time.
+        assert torch.equal(out, ref), "pipelined matmul is non-deterministic (suspect a cross-tile race)"
 
 
 def test_validation_errors():

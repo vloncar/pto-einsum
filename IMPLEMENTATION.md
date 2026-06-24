@@ -530,6 +530,15 @@ call it. `K!=C` forces both flags false (those inputs genuinely need §2.2's pad
 repack). Net: the full einsum collapses onto the matmul — 2048² fp16 2339→178 µs
 (13×), fp32 3913→338 µs (~parity with torch).
 
+The skip is gated on the *identity* perm. The common attention / GDN contractions
+(`bihd,bjhd->bihj`, `bihj,bjhd->bihd`) instead reorder only batch/free axes (head `h`
+before `i`), a non-identity perm that does **not** qualify today, so they run Phase A.
+Its generalization — feeding the matmul the batch/free-permuted operand directly via
+strided GM→L1 addressing (the contraction axis stays innermost+contiguous, so no
+element actually moves) — is the **strided-input matmul** roadmap item, the input-side
+mirror of §2.9 and the largest remaining GDN lever (Phase A is ~57 % of those stages,
+profiled below).
+
 ## 2.9 Fused output permutation (skip Phase C on non-identity outputs)
 
 Generalizes §2.3 from "perm is identity" to "perm keeps the matmul's `free1` axis
@@ -569,6 +578,48 @@ plain deep-pipelined schedule runs the fused store. Measured (A/B vs forced Phas
 `bshd,bthd->bsht` S=512 **3.6–3.9×**, `bsht,bthd->bshd` S=512 **1.18×**, GDN per-chunk
 contractions **1.1–1.4×** — all bit-exact, no regression.
 
+## 2.10 Cross-tile software pipelining (`matmul_tile_loop_pipelined`)
+
+§2.7 pipelines *within* a tile (its `Kd`-deep chunk prefetch). When `K` is small —
+e.g. the 128×128×128 GEMMs a batched attention / GDN contraction decomposes into —
+the deep schedule's `nKd == 1`, so the within-tile prefetch never fires and each
+tile's GM→L1 load (MTE2) and fixpipe store (FIX) run fully exposed; the Cube idles
+at ~15 % HBM, **latency-bound** (this is the opposite of the bandwidth-saturated
+large-GEMM regime, so the mix-kernel lever does not apply). For that regime the plain
+schedule pipelines *across* tiles:
+
+- **L1 A/B ping-pong** across two buffers — prefetch tile `t+1`'s operands (MTE2)
+  under the compute of tile `t`.
+- **L0C accumulator ping-pong** across `c_l0[2]` (the two 128×128-f32 accumulators
+  that exactly fill the 128 KB L0C) — tile `t−1`'s fixpipe store drains under the
+  compute of tile `t`; the store is issued non-blocking and waited only at `t+2`
+  reuse / loop-exit drain. Flags are drained once at exit, not per tile. The L1→L0
+  `TEXTRACT` phase machinery is reused from `matmul_one_tile_deep` verbatim, and
+  `FUSE_OUT` (§2.9) is handled inside the loop, so the fused-output store lands here too.
+
+**Gate** (`MatmulPipeline<data_T,CONFIG_T>::PIPELINE_TILES`): `nKd == 1 &&
+!A_PADDED && !B_PADDED` (all tiles full → the valid extents are loop-invariant, set
+once; a partial-tile config keeps the per-tile deep path) `&& 2·Mt·Nt·4 ≤ 128 KB`
+(the L0C ping-pong bound) `&& total_tiles ≥ MIN_TILES (32)`. Routed by an `if
+constexpr` in `batched_matmul_inline`'s plain schedule, so it lands on both the
+standalone matmul and the fused mix-kernel. The gate is a **sufficient precondition**
+for the loop's L1/L0A/L0B capacity `static_assert`s (all implied by `deep_pick_kq/kd`),
+so a mis-selection is a loud compile error, never a silent miscompute — pinned by a
+`namespace gate_selftest` of namespace-scope `static_assert`s on canonical shapes
+(fp32/fp16 128³ and `total_tiles == MIN_TILES` must fire; single-tile, large-K
+`nKd>1`, and partial-tile `A_PADDED` must not), proven to have teeth via a negated
+probe. A `test_pipelined_matmul_deterministic` runs the loop 8× on identical input
+asserting `torch.equal` bit-exact — the cross-tile race that an earlier shallow-`Kt`
+attempt hit ([2.4] note) does **not** recur with the L0C-ping-pong + non-blocking-store
+design (no `PIPE_ALL` needed; bit-exact across 2048 tiles incl. fused-output).
+
+**Perf** (A/B = `MIN_TILES` huge to disable vs 32; isolated batched 128³ matmul):
+fp32 B=512 **1.94×** (79.5→40.9 µs), fp16 B=512 **1.51×** (39.5→26.2 µs); the win
+peaks in a mid band — enough tiles/core for steady state, not yet bandwidth-bound
+(B=2048 ≈ 1.0×). In the GDN stages the matmul is glue-diluted and the batch is below
+the steady-state band, so end-to-end is **neutral-to-7 %** (no regression); the
+larger GDN win is the input-side Phase-A elimination tracked in the roadmap.
+
 ---
 
 ## Build cache caveat
@@ -580,6 +631,25 @@ stale `.so` is reused and the change appears to have no effect.
 
 ## Roadmap
 
+- **Strided-input matmul (generalized §2.8 skip) — highest-value GDN lever, next up.**
+  The GDN `kkt` (`bihd,bjhd->bihj`), `wy_fast` (`bihj,bjhd->bihd`), and `chunk_o`
+  contractions reorder only batch/free axes (head `h` before query `i`); the
+  contraction axis (`d` / `j`) stays innermost and contiguous, and `K==C`, so the
+  reorder is a pure addressing change — no element moves — yet today it fails §2.8's
+  *identity-perm* gate and runs Phase A (materialize a transposed copy of each input
+  to GM, then read it back). `torch.einsum` dispatches a single strided bmm that reads
+  the original layout directly, which is exactly the gap. **Profiled** (A/B with
+  identical matmul work, Phase A on vs off, `benchmarks/profile_phaseA.py`): Phase A is
+  **~57 %** of each stage's time; with it on, pto is **1.7–1.8× slower** than torch,
+  with it off pto is **0.72–0.78×** (i.e. *beats* torch — the matmul + fused output are
+  already ahead). **Fix:** extend `EinsumSkip` from "identity perm + `K==C`" to
+  "contraction axis innermost & contiguous + `K==C`", feeding `data0`/`data1` to the
+  Cube with the real per-batch base offset and per-row stride baked into the ND→NZ
+  `Shape`/`Stride` — decoded the same way `FUSE_OUT` (§2.9) decodes the strided *store*
+  base. Drops Phase A entirely for these stages (round-trip DMA **and** the Phase-A
+  dispatch), recovering ~57 %. The Left-operand partial-C0 ND→NZ quirk does not apply
+  (`K==C`, full blocks). Residual per-stage launch overhead is then a graph-capture
+  target (a separate dispatch-elim lever, ~2.4× at launch-bound small-`T`).
 - Lift the N-D batched-`TTRANS` `srcColStride==1` requirement (source whose
   second-innermost output axis is non-contiguous) — needs a non-contiguous gather,
   not a single strided DMA.
@@ -599,11 +669,9 @@ stale `.so` is reused and the change appears to have no effect.
   an FFTS barrier, workspace sizing, dispatch plumbing). The reduced operand then
   feeds the existing transpose→matmul→transpose pipeline unchanged. Keeps the op fused
   and on-device.
-- **Fused output permutation — LANDED (§2.9).** The Cube store now lands each tile
-  straight in `res` for the common `free1`-innermost outputs (most attention / GDN
-  contractions), eliminating Phase C, the second `SyncAll`, and the `ws_res` buffer.
-  Remaining follow-on: the **strided-col** case (`free1` *not* innermost) still runs
-  Phase C, and split-K (§2.6) could be extended to atomic-add into the permuted
+- Fused output permutation follow-on (§2.9 landed the common case): the **strided-col**
+  output (`free1` *not* innermost) still runs Phase C — the strided-col fixpipe store is
+  unverified — and split-K (§2.6) could be extended to atomic-add into the permuted
   window (it stays gated on `OUT_IDENTITY` for now).
 - **Distributed (multi-NPU) einsum — overlapped ring/context-parallel attention only;
   *not* a general distributed einsum.** *Context:* PTO-ISA ships a complete inter-NPU
