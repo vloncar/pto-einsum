@@ -37,7 +37,7 @@ _NO_FUSE = dict(
 # Neutral NT strided-input fields (non-NT default). The matmul path overrides these
 # when the contraction is innermost+contiguous on both inputs (see parse_recipe).
 _NO_NT = dict(
-    in_nt=0, in_n_batch=0, in0_row_stride=0, in1_col_stride=0,
+    in_nt=0, in_n_batch=0, in0_row_stride=0, in1_col_stride=0, in1_k_stride=0,
     in_batch_sizes=(), in0_batch_strides=(), in1_batch_strides=(),
 )
 
@@ -84,17 +84,22 @@ class EinsumRecipe(TypedDict):
     out_n_batch: int
     out_batch_sizes: tuple
     out_batch_strides: tuple
-    # NT strided-input matmul (drop Phase A). Set when the contraction axis is the
-    # innermost (contiguous) axis of both inputs, free0/free1 are each a single axis,
-    # and the contraction is 16-aligned (K==C) with full output tiles: the Cube reads
-    # both operands straight from the raw tensors (input0 row-strided, input1 DN-
-    # transposed), skipping the input transposes. in0_row_stride / in1_col_stride are
-    # the source strides of free0 / free1; the batch arrays decode the flat batch index
-    # into each operand's source base. Neutral (in_nt=0) when not NT-eligible.
+    # Direct-input matmul (drop Phase A). Two read modes, both requiring the
+    # contraction innermost+contiguous on input0 (A read as a row-strided ND tile),
+    # free0/free1 each a single axis, 16-aligned contraction (K==C) and full output
+    # tiles. in_nt selects the input1 (B) orientation:
+    #   1 = NT: contraction innermost on input1 too -> B read transposed via Layout::DN
+    #           (B_K_STRIDE=1, B_N_STRIDE=in1_col_stride).
+    #   2 = NN-strided: free1 innermost on input1 -> B read as Layout::ND with a STRIDED
+    #           K row (B_K_STRIDE=in1_k_stride, the head-interleaved stride; B_N_STRIDE=1).
+    # in0_row_stride / in1_col_stride are the source strides of free0 / free1; in1_k_stride
+    # is input1's contraction stride (NN-strided only). The batch arrays decode the flat
+    # batch index into each operand's source base. Neutral (in_nt=0) when not eligible.
     in_nt: int
     in_n_batch: int
     in0_row_stride: int
     in1_col_stride: int
+    in1_k_stride: int
     in_batch_sizes: tuple
     in0_batch_strides: tuple
     in1_batch_strides: tuple
@@ -278,27 +283,33 @@ class EinsumBuilder:
         else:
             fuse_fields = dict(_NO_FUSE)
 
-        # NT strided-input matmul. When the contraction axis is the innermost
-        # (contiguous, stride 1) axis of BOTH inputs and free0/free1 are each a single
-        # axis, the Cube can read both operands straight from the raw tensors — input0
-        # as a row-strided ND tile, input1 transposed via a DN read — skipping Phase A's
-        # transpose entirely. Requires a 16-aligned contraction (K==C, so no contraction
-        # pad) and full output tiles (free dims tile-aligned, so no zero-pad row/col the
-        # strided read cannot synthesize). Composes with the fused output store above.
-        nt_eligible = (
+        # Direct-input matmul (skip Phase A). Both read modes require the contraction
+        # axis to be the innermost (contiguous, stride 1) axis of input0 (A read as a
+        # row-strided ND tile) and free0/free1 each a single axis. They differ in input1:
+        #   NT (mode 1): contraction innermost on input1 too -> B read transposed via a
+        #       DN read (the flash Q@K^T pattern).
+        #   NN-strided (mode 2): free1 innermost on input1 -> B read as ND with a STRIDED
+        #       K row (an interleaved head axis sits between K and N, e.g. bjhd's j).
+        # Both require a 16-aligned contraction (K==C, so no contraction pad) and full
+        # output tiles (free dims tile-aligned, so no zero-pad row/col the strided read
+        # cannot synthesize). Composes with the fused output store above.
+        single_axes = (
             os.getenv("EINSUM_DISABLE_NT", "0") == "0"
             and len(contract) == 1 and len(invariant0) == 1 and len(invariant1) == 1
-            and in0[-1] == contract[0] and in1[-1] == contract[0]
             and contract_size % 16 == 0
         )
-        if nt_eligible:
+        a_natural = single_axes and in0[-1] == contract[0]
+        nt_mode = a_natural and in1[-1] == contract[0]
+        nn_mode = a_natural and not nt_mode and in1[-1] == invariant1[0]
+        read_direct = nt_mode or nn_mode
+        if read_direct:
             pad16 = lambda x: (x + 15) // 16 * 16
             tile = int(os.getenv("EINSUM_TILE_SIZE", "128"))
             Mpad, Npad = pad16(invariant_size0), pad16(invariant_size1)
             Mt, Nt = min(tile, Mpad), min(tile, Npad)
             if Mpad % Mt != 0 or Npad % Nt != 0:
-                nt_eligible = False
-        if nt_eligible:
+                read_direct = False
+        if read_direct:
             def _row_strides(shape):
                 s = [1] * len(shape)
                 run = 1
@@ -309,10 +320,11 @@ class EinsumBuilder:
             st0 = _row_strides(input_shape0)
             st1 = _row_strides(input_shape1)
             nt_fields = dict(
-                in_nt=1,
+                in_nt=1 if nt_mode else 2,
                 in_n_batch=len(inplace),
                 in0_row_stride=int(st0[in0.index(invariant0[0])]),
                 in1_col_stride=int(st1[in1.index(invariant1[0])]),
+                in1_k_stride=int(st1[in1.index(contract[0])]),
                 in_batch_sizes=tuple(int(s) for s in inplace_shape),
                 in0_batch_strides=tuple(int(st0[in0.index(ax)]) for ax in inplace),
                 in1_batch_strides=tuple(int(st1[in1.index(ax)]) for ax in inplace),
@@ -519,6 +531,7 @@ class EinsumBuilder:
             in_n_batch=self.recipe['in_n_batch'],
             in0_row_stride=self.recipe['in0_row_stride'],
             in1_col_stride=self.recipe['in1_col_stride'],
+            in1_k_stride=self.recipe['in1_k_stride'],
             NIB=len(in_batch_sizes),
             in_batch_sizes=', '.join(str(x) for x in in_batch_sizes),
             in0_batch_strides=', '.join(str(x) for x in in0_batch_strides),

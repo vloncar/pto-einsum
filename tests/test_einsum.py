@@ -81,6 +81,14 @@ from pto_einsum import einsum, EinsumBuilder
     ("bnd, bmd -> bnm", (8, 128, 64), (8, 128, 64)),               # single batch axis, K=64==C
     ("bihd, bjhd -> bihj", (2, 64, 4, 32), (2, 96, 4, 32)),        # asymmetric i!=j, sub-tile + K=32
 
+    # --- NN-strided direct input (contraction innermost on input0, free1 innermost on
+    # input1 -> B read as ND with a strided K row; the head axis interleaves K and N).
+    # These are GDN wy_fast / chunk_o-intra; free1 innermost in res so fused out composes.
+    ("bihj, bjhd -> bihd", (2, 128, 16, 128), (2, 128, 16, 128)),  # wy_fast: NN-strided + fused out
+    ("bihj, bjhd -> bihd", (4, 128, 4, 128), (4, 128, 4, 128)),    # fewer heads
+    ("bvhd, bhde -> bvhe", (4, 128, 8, 64), (4, 8, 64, 64)),       # chunk_o inter: B contiguous K (e=N)
+    ("bnj, bjm -> bnm", (8, 128, 128), (8, 128, 64)),              # single batch axis, contiguous B
+
     # --- non-16-aligned contraction (K != C): K-padded transpose destinations ---
     # j=20 -> K=32: identity-copy inputs (ij,jk) and a=20 -> K=32: 2D-TTRANS (ai,ja).
     ("ij, jk -> ik", (32, 20), (20, 128)),
@@ -287,6 +295,36 @@ def test_nt_strided_input_deterministic(dtype):
     for _ in range(8):
         out = runner(inp0, inp1)
         assert torch.equal(out, ref), "NT strided-input matmul is non-deterministic (suspect a cross-tile race)"
+    builder.cleanup()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_nn_strided_input_deterministic(dtype):
+    # NN-strided direct-input path (Phase A dropped: input0 read row-strided, input1 read
+    # as Layout::ND with a STRIDED K row -- the head axis interleaves between the
+    # contraction j and the free e). The wy_fast contraction routes through the cross-tile
+    # pipelined loop and fires the fused output store. Pins that the strided-K right-operand
+    # read is bit-exact vs torch AND introduces no cross-tile race.
+    if TEST_DEVICE == "cpu":
+        pytest.skip("NN-strided direct-input Cube path is NPU-only")
+
+    equation = "bihj, bjhd -> bihd"
+    shape0, shape1 = (2, 128, 16, 128), (2, 128, 16, 128)
+    builder = EinsumBuilder(equation, [shape0, shape1], dtype, device=TEST_DEVICE)
+    runner = builder.build()
+    assert "in_nt = 2" in builder.cpp_code, "wy_fast-shaped contraction should take the NN-strided path"
+
+    inp0 = torch.rand(shape0, dtype=dtype, device=TEST_DEVICE)
+    inp1 = torch.rand(shape1, dtype=dtype, device=TEST_DEVICE)
+
+    ref = runner(inp0, inp1).clone()
+    expected = torch.einsum(equation, inp0, inp1).to(dtype=torch.float32)
+    rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
+    torch.testing.assert_close(ref, expected, rtol=rtol, atol=atol)
+
+    for _ in range(8):
+        out = runner(inp0, inp1)
+        assert torch.equal(out, ref), "NN-strided direct-input matmul is non-deterministic (suspect a cross-tile race)"
     builder.cleanup()
 
 

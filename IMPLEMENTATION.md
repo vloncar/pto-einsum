@@ -621,10 +621,12 @@ larger GDN win is the input-side Phase-A elimination (§2.11).
 ## 2.11 NT strided-input matmul (skip Phase A on the GDN contractions)
 
 The input-side mirror of §2.9, and the generalization of §2.8 from the *identity-perm*
-gate to **"contraction axis innermost + contiguous on both inputs."** The GDN attention
-contractions (`kkt` `bihd,bjhd->bihj`, `wy_fast` `bihj,bjhd->bihd`, `chunk_o`) reorder
-only batch/free axes (head `h` before query `i`); the contraction axis stays innermost
-and contiguous and `K==C`, so the reorder is a pure addressing change — no element moves.
+gate to **"contraction axis innermost + contiguous on both inputs."** The GDN `kkt`
+contraction (`bihd,bjhd->bihj`, also `chunk_o`'s `qk`) reorders only batch/free axes
+(head `h` before query `i`); the contraction axis `d` stays innermost and contiguous and
+`K==C`, so the reorder is a pure addressing change — no element moves. (The sibling
+`wy_fast`/`chunk_o-intra` contractions — contraction innermost on input0 but *not*
+input1 — are handled by the NN-strided read in §2.12.)
 Yet they fail §2.8's identity gate, and the deeper reason is that the matmul implemented
 **only the NN layout** (`ws0=[M,K]`, `ws1=[K,N]`): input1 `bjhd` is stored `[j,d]=[N,K]`,
 so feeding the NN Cube *required* the `[j,d]→[d,j]` transpose that Phase A materializes
@@ -669,6 +671,47 @@ overhead is a graph-capture target (dispatch-elim, ~2.4× at launch-bound small-
 
 ---
 
+## 2.12 NN-strided direct input (skip Phase A on `wy_fast` / `chunk_o`)
+
+The second read mode of the §2.11 direct-input machinery. NT (§2.11) needs the
+contraction innermost on **both** inputs; the GDN `wy_fast`/`chunk_o-intra`
+(`bihj,bjhd->bihd`, contract `j`) and `chunk_o-inter` (`bvhd,bhde->bvhe`, contract `d`)
+have the contraction innermost on **input0 only**. There is no transpose to do — input1
+`bjhd` is *already* the `[K,N]=[j,d]` matrix the NN Cube wants (`N=d` innermost), it just
+has `K=j` **strided** by `H·Dᵥ` because the head axis sits between `j` and `d`. So Phase A
+here was a pure strided **copy** (not a transpose), and the fix is to let the Cube read
+input1 directly with that strided `K` row.
+
+- **Read mode.** Input0 is the same row-strided **ND** tile as NT (contraction
+  contiguous). Input1 is read as **`Layout::ND`** (the canonical NN orientation) but with
+  a **strided `K` row**: `B_K_STRIDE = in1_k_stride` (input1's contraction stride, e.g.
+  `H·Dᵥ`) instead of the contiguous `Bcols`, `B_N_STRIDE = 1` (free1 innermost). Tile
+  orientation (`BLayout::ColMajor`, `SLayout::RowMajor`) is identical to the NN path —
+  only the `K` row stride and the batch-decoded base differ. The Cube ND→NZ DMA accepts a
+  non-contiguous `K` row on the **right** operand (A's strided-ND read was already proven
+  by NT; B's was always contiguous) — verified standalone (`scratchpad/nn_proto.cpp`,
+  bit-exact). The `chunk_o-inter` case degenerates to `in1_k_stride == N` (contiguous B),
+  still skipping the copy.
+- **Gate.** `parse_recipe` sets `in_nt = 2` when input0 is `K`-innermost (`a_natural`),
+  input1 is `free1`-innermost (and *not* NT), `K==C`, single `free0`/`free1`, full tiles.
+  `NtInput<CONFIG_T>::dn` (`in_nt==1`) selects the DN transposed read; otherwise the
+  strided-ND read. `NtInput::value` (`in_nt!=0`) already drives `RD0/RD1` and the split-K
+  exclusion, so `pto_einsum.h` is unchanged. Shares the `EINSUM_DISABLE_NT` escape hatch.
+- **Threaded** through the same `NT_IN` param; the only new device branch is
+  `B_K_STRIDE = NT_DN ? 1 : (NT_IN ? in1_k_stride : Bcols)` (and the within-tile chunk
+  offset `bChunk = bBase + k0·B_K_STRIDE`, which is provably equal to the old NT/NN
+  ternaries). Composes with §2.9 (`wy_fast` reads strided **and** stores fused) and
+  §2.10's cross-tile pipeline.
+
+**Perf** (production einsum, `wy_fast` `bihj,bjhd->bihd`, fp32, on vs off vs torch):
+**3.5–4.9× faster than the prior Phase-A path** and **1.5–2.2× faster than torch**
+(16×16 78 vs 276 vs 116 µs; 64×16 364 vs 1772 vs 795 µs; 16×48 302 vs 1296 vs 606 µs).
+**Bit-exact** (fp32 rel=0, fp16 in tol); `test_einsum` adds NN-strided correctness cases
++ `test_nn_strided_input_deterministic` (`in_nt==2`, 8× `torch.equal`); full suite **175
+passed / 2 skipped**, no regressions.
+
+---
+
 ## Build cache caveat
 
 The build cache key is an MD5 of the **generated `.cpp`** (the config structs and
@@ -678,14 +721,17 @@ stale `.so` is reused and the change appears to have no effect.
 
 ## Roadmap
 
-- **NT strided-input matmul — LANDED (§2.11).** The GDN `kkt`/`wy_fast`/`chunk_o`
-  contractions now read both operands straight from the raw tensors (input0 row-strided
-  ND, input1 transposed via `Layout::DN`), dropping Phase A: **2.0–2.2× faster than torch**
-  and **3.4–3.8× faster than the prior Phase-A path**, bit-exact, no regressions. Residual
-  per-stage launch overhead is now the next GDN lever — a **graph-capture** target
-  (dispatch-elim, ~2.4× at launch-bound small-`T`). Possible NT follow-ons: multi-axis
-  free dims (only single-axis `free0`/`free1` are NT-eligible today) and a multi-axis
-  contiguous contraction block.
+- **Direct-input matmul — LANDED (§2.11 NT + §2.12 NN-strided).** All three GDN
+  contraction shapes now read both operands straight from the raw tensors, dropping
+  Phase A: `kkt`/`chunk_o-qk` via the NT (DN-transposed) read (**2.0–2.2× vs torch**,
+  3.4–3.8× vs Phase A), and `wy_fast`/`chunk_o-intra`/`chunk_o-inter` via the NN-strided
+  (strided-`K` ND) read (**1.5–2.2× vs torch**, 3.5–4.9× vs Phase A). Bit-exact, no
+  regressions. Residual per-stage launch overhead is now the next GDN lever — a
+  **graph-capture** target (dispatch-elim, ~2.4× at launch-bound small-`T`). Remaining
+  direct-read follow-ons: the `chunk_h` `bvhd,bvhe->bhde` matmul (contraction *not*
+  innermost on input0 → a transposed-**A** "TN" read, `Layout::DN` on A); multi-axis
+  free dims (only single-axis `free0`/`free1` are eligible today); multi-axis contiguous
+  contraction.
 - Lift the N-D batched-`TTRANS` `srcColStride==1` requirement (source whose
   second-innermost output axis is non-contiguous) — needs a non-contiguous gather,
   not a single strided DMA.

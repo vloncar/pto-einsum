@@ -94,9 +94,13 @@ struct NtInput {
     using G = MatmulGeom<CONFIG_T>;
     static constexpr bool value = (CONFIG_T::in_nt != 0u)
                                   && (G::K == G::C) && !G::A_PADDED && !G::B_PADDED;
+    // in_nt == 1 -> NT (B read transposed via Layout::DN); == 2 -> NN-strided (B read
+    // as Layout::ND with a strided K row). Both read A as a row-strided ND tile.
+    static constexpr bool dn = (CONFIG_T::in_nt == 1u);
     static constexpr unsigned n_batch = CONFIG_T::in_n_batch;
     static constexpr unsigned row_stride0 = CONFIG_T::in0_row_stride;  // src stride of free0 (input0)
     static constexpr unsigned col_stride1 = CONFIG_T::in1_col_stride;  // src stride of free1 (input1)
+    static constexpr unsigned k_stride1 = CONFIG_T::in1_k_stride;      // src stride of contraction (input1, NN-strided)
 };
 
 // One output tile, basic per-Kt schedule: contract the K-tile range
@@ -403,18 +407,24 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
         constexpr unsigned nKd = K / Kd;   // L1 chunk count
         constexpr unsigned nP  = Kd / Kq;  // L0 phases per chunk
 
-        // NT strided-input: read both operands straight from the raw tensors (no Phase A).
-        // A is a row-strided ND tile (free0 row stride NtIn::row_stride0, contraction
-        // contiguous); B is read transposed via Layout::DN (contraction contiguous == K
-        // innermost, free1 col stride NtIn::col_stride1, SLayout::ColMajor Mat tile). The
-        // default (NT_IN=false) path is the canonical contiguous ws0/ws1 read, unchanged.
+        // Direct strided-input: read both operands straight from the raw tensors (no
+        // Phase A). A is always a row-strided ND tile (free0 row stride NtIn::row_stride0,
+        // contraction contiguous). B has two read modes:
+        //   NT (NtIn::dn): transposed via Layout::DN (contraction contiguous == K
+        //       innermost, B_K_STRIDE=1, free1 col stride NtIn::col_stride1, ColMajor tile).
+        //   NN-strided (NT_IN && !dn): Layout::ND with a strided K row (B_K_STRIDE=
+        //       NtIn::k_stride1, free1 contiguous so B_N_STRIDE=col_stride1==1), i.e. the
+        //       canonical NN tile orientation with a non-contiguous K row stride.
+        // The default (NT_IN=false) path is the contiguous ws0/ws1 read, byte-for-byte
+        // unchanged (B_K_STRIDE=Bcols == k_stride uniform below).
         using NtIn = NtInput<CONFIG_T>;
+        constexpr bool NT_DN = NT_IN && NtIn::dn;
         constexpr unsigned A_ROW_STRIDE = NT_IN ? NtIn::row_stride0 : K;
-        constexpr unsigned B_K_STRIDE   = NT_IN ? 1u : Bcols;
+        constexpr unsigned B_K_STRIDE   = NT_DN ? 1u : (NT_IN ? NtIn::k_stride1 : Bcols);
         constexpr unsigned B_N_STRIDE   = NT_IN ? NtIn::col_stride1 : 1u;
-        constexpr pto::Layout B_LAYOUT  = NT_IN ? pto::Layout::DN : pto::Layout::ND;
-        constexpr pto::BLayout B_BLAYOUT = NT_IN ? pto::BLayout::RowMajor : pto::BLayout::ColMajor;
-        constexpr pto::SLayout B_SLAYOUT = NT_IN ? pto::SLayout::ColMajor : pto::SLayout::RowMajor;
+        constexpr pto::Layout B_LAYOUT  = NT_DN ? pto::Layout::DN : pto::Layout::ND;
+        constexpr pto::BLayout B_BLAYOUT = NT_DN ? pto::BLayout::RowMajor : pto::BLayout::ColMajor;
+        constexpr pto::SLayout B_SLAYOUT = NT_DN ? pto::SLayout::ColMajor : pto::SLayout::RowMajor;
 
         using ShapeA = pto::Shape<1, 1, 1, -1, Kd>;
         using StrideA = pto::Stride<1, 1, 1, A_ROW_STRIDE, 1>;
@@ -531,7 +541,7 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
                 unsigned k0 = (c + 1) * Kd;
                 // Contraction K-offset: contiguous for NT (stride 1 -> +k0), row-strided
                 // for the canonical layout (B's K stride is Bcols -> +k0*Bcols).
-                const __gm__ data_T* bChunk = NT_IN ? (bBase + k0) : (bBase + size_t(k0) * Bcols);
+                const __gm__ data_T* bChunk = bBase + size_t(k0) * B_K_STRIDE;
                 pto::GlobalTensor<data_T, ShapeA, StrideA> ag(const_cast<__gm__ data_T*>(aBase + k0), ShapeA(loadM));
                 GlobalB bg(const_cast<__gm__ data_T*>(bChunk), ShapeB(loadN));
                 wait_flag(PIPE_MTE1, PIPE_MTE2, aLdN);
@@ -648,16 +658,18 @@ AICORE inline void matmul_tile_loop_pipelined(__gm__ const data_T* ws0, __gm__ c
 
         if (start >= end) return;
 
-        // NT strided-input (see matmul_one_tile_deep): A row-strided ND, B transposed via
-        // Layout::DN. nKd==1 here so there is no within-tile K-chunk offset. Default path
-        // (NT_IN=false) is the canonical contiguous ws0/ws1 read, byte-for-byte unchanged.
+        // Direct strided-input (see matmul_one_tile_deep): A row-strided ND; B either NT
+        // (DN-transposed, NtIn::dn) or NN-strided (ND with a strided K row). nKd==1 here so
+        // there is no within-tile K-chunk offset. Default path (NT_IN=false) is the
+        // canonical contiguous ws0/ws1 read, byte-for-byte unchanged.
         using NtIn = NtInput<CONFIG_T>;
+        constexpr bool NT_DN = NT_IN && NtIn::dn;
         constexpr unsigned A_ROW_STRIDE = NT_IN ? NtIn::row_stride0 : K;
-        constexpr unsigned B_K_STRIDE   = NT_IN ? 1u : Bcols;
+        constexpr unsigned B_K_STRIDE   = NT_DN ? 1u : (NT_IN ? NtIn::k_stride1 : Bcols);
         constexpr unsigned B_N_STRIDE   = NT_IN ? NtIn::col_stride1 : 1u;
-        constexpr pto::Layout B_LAYOUT  = NT_IN ? pto::Layout::DN : pto::Layout::ND;
-        constexpr pto::BLayout B_BLAYOUT = NT_IN ? pto::BLayout::RowMajor : pto::BLayout::ColMajor;
-        constexpr pto::SLayout B_SLAYOUT = NT_IN ? pto::SLayout::ColMajor : pto::SLayout::RowMajor;
+        constexpr pto::Layout B_LAYOUT  = NT_DN ? pto::Layout::DN : pto::Layout::ND;
+        constexpr pto::BLayout B_BLAYOUT = NT_DN ? pto::BLayout::RowMajor : pto::BLayout::ColMajor;
+        constexpr pto::SLayout B_SLAYOUT = NT_DN ? pto::SLayout::ColMajor : pto::SLayout::RowMajor;
 
         using ShapeA = pto::Shape<1, 1, 1, -1, Kd>;
         using StrideA = pto::Stride<1, 1, 1, A_ROW_STRIDE, 1>;
