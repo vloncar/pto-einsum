@@ -530,14 +530,12 @@ call it. `K!=C` forces both flags false (those inputs genuinely need §2.2's pad
 repack). Net: the full einsum collapses onto the matmul — 2048² fp16 2339→178 µs
 (13×), fp32 3913→338 µs (~parity with torch).
 
-The skip is gated on the *identity* perm. The common attention / GDN contractions
+This skip is gated on the *identity* perm. The common attention / GDN contractions
 (`bihd,bjhd->bihj`, `bihj,bjhd->bihd`) instead reorder only batch/free axes (head `h`
-before `i`), a non-identity perm that does **not** qualify today, so they run Phase A.
-Its generalization — feeding the matmul the batch/free-permuted operand directly via
-strided GM→L1 addressing (the contraction axis stays innermost+contiguous, so no
-element actually moves) — is the **strided-input matmul** roadmap item, the input-side
-mirror of §2.9 and the largest remaining GDN lever (Phase A is ~57 % of those stages,
-profiled below).
+before `i`), a non-identity perm that does not qualify here — but since the contraction
+axis stays innermost+contiguous, no element actually moves, so they are fed to the matmul
+directly via strided GM→L1 addressing by the **NT strided-input path (§2.11)**, the
+input-side mirror of §2.9 and the largest GDN lever (Phase A was ~57 % of those stages).
 
 ## 2.9 Fused output permutation (skip Phase C on non-identity outputs)
 
@@ -618,7 +616,56 @@ fp32 B=512 **1.94×** (79.5→40.9 µs), fp16 B=512 **1.51×** (39.5→26.2 µs)
 peaks in a mid band — enough tiles/core for steady state, not yet bandwidth-bound
 (B=2048 ≈ 1.0×). In the GDN stages the matmul is glue-diluted and the batch is below
 the steady-state band, so end-to-end is **neutral-to-7 %** (no regression); the
-larger GDN win is the input-side Phase-A elimination tracked in the roadmap.
+larger GDN win is the input-side Phase-A elimination (§2.11).
+
+## 2.11 NT strided-input matmul (skip Phase A on the GDN contractions)
+
+The input-side mirror of §2.9, and the generalization of §2.8 from the *identity-perm*
+gate to **"contraction axis innermost + contiguous on both inputs."** The GDN attention
+contractions (`kkt` `bihd,bjhd->bihj`, `wy_fast` `bihj,bjhd->bihd`, `chunk_o`) reorder
+only batch/free axes (head `h` before query `i`); the contraction axis stays innermost
+and contiguous and `K==C`, so the reorder is a pure addressing change — no element moves.
+Yet they fail §2.8's identity gate, and the deeper reason is that the matmul implemented
+**only the NN layout** (`ws0=[M,K]`, `ws1=[K,N]`): input1 `bjhd` is stored `[j,d]=[N,K]`,
+so feeding the NN Cube *required* the `[j,d]→[d,j]` transpose that Phase A materializes
+(a GM round-trip + a dispatch). The phase profiler (`benchmarks/profile_phaseA.py`) found
+Phase A is **~57 %** of each stage; with it on pto was **1.7–1.8× slower** than torch,
+with it off **0.72–0.78×** (the matmul + fused store were already ahead). `torch.einsum`
+dispatches one strided **NT** bmm (both operands `K`-innermost) reading the raw layout — so
+the fix is to add that NT read.
+
+- **Read both operands straight from the raw tensors, no Phase A.** Input0 is a
+  row-strided **ND** tile (free0 row stride `in0_row_stride`, contraction contiguous);
+  input1 is read **transposed via `Layout::DN`** (contraction contiguous == `K`
+  innermost, free1 col stride `in1_col_stride`, `SLayout::ColMajor` Mat tile) — the
+  flash-attention `Q@Kᵀ` pattern. The **Cube** ND→NZ DMA supports the DN transposed read
+  (this is *not* the Vector TTRANS path that lacks a strided-inner mode). Verified first
+  as a standalone kernel (`scratchpad/nt_proto.cpp`), incl. the multi-phase K-sub-extract
+  from a DN/ColMajor Mat tile (`nt_proto2.cpp`).
+- **Gate** (`NtInput<CONFIG_T>`, a `static constexpr` struct): host-side `parse_recipe`
+  sets `in_nt` when the single contraction axis is innermost on both inputs, `free0`/`free1`
+  are each a single axis, `K==C`, and the output tiles are full; the device struct
+  **re-confirms the geometry** (`K==C && !A_PADDED && !B_PADDED`) so a host/device mismatch
+  is a compile-time gate, never a silent misread. Emits per-operand source strides +
+  a batch-axis decode (`in0_row_stride`, `in1_col_stride`, `in_batch_sizes/[01]_batch_strides[]`),
+  mirroring `FUSE_OUT`'s `out_*` plumbing. `EINSUM_DISABLE_NT=1` forces it off (A/B + escape hatch).
+- **Threaded** through `batched_matmul_inline` → `matmul_one_tile_deep` /
+  `matmul_tile_loop_pipelined` as a `bool NT_IN = false` template param: when set, the A
+  row stride, the B `K`/`N` strides + `Layout::DN` + Mat-tile `SLayout`, and the
+  `aBase`/`bBase` batch decode switch via `if constexpr`. **Default false → the NN path
+  is byte-for-byte unchanged.** In the fused kernel `RD0/RD1 = SKIP* || NT_IN` are the
+  read-direct flags (skip Phase A, read the raw tensor) and `einsum_setup`/`exec` drop
+  both workspace buffers. Composes with §2.9 (kkt reads NT **and** stores fused) and routes
+  through §2.10's cross-tile pipeline (kkt is `nKd==1`, 32+ tiles).
+
+**Perf** (production einsum, kkt `bihd,bjhd->bihj`, fp32, NT-on vs NT-off vs torch):
+NT-on is **3.4–3.8× faster than the prior Phase-A path** and **2.0–2.2× faster than
+torch** (16×16 54 vs 189 vs 109 µs; 64×16 366 vs 1401 vs 807 µs; 16×48 302 vs 1028 vs
+621 µs) — even with the fused-kernel barrier the production path matches the unpipelined
+prototype's 55 µs. **Bit-exact** (fp32 rel=0, fp16 in tol); `test_einsum` adds NT
+correctness cases + `test_nt_strided_input_deterministic` (8× `torch.equal`, the
+cross-tile-race guard); full suite green, no regressions. Residual per-stage launch
+overhead is a graph-capture target (dispatch-elim, ~2.4× at launch-bound small-`T`).
 
 ---
 
@@ -631,25 +678,14 @@ stale `.so` is reused and the change appears to have no effect.
 
 ## Roadmap
 
-- **Strided-input matmul (generalized §2.8 skip) — highest-value GDN lever, next up.**
-  The GDN `kkt` (`bihd,bjhd->bihj`), `wy_fast` (`bihj,bjhd->bihd`), and `chunk_o`
-  contractions reorder only batch/free axes (head `h` before query `i`); the
-  contraction axis (`d` / `j`) stays innermost and contiguous, and `K==C`, so the
-  reorder is a pure addressing change — no element moves — yet today it fails §2.8's
-  *identity-perm* gate and runs Phase A (materialize a transposed copy of each input
-  to GM, then read it back). `torch.einsum` dispatches a single strided bmm that reads
-  the original layout directly, which is exactly the gap. **Profiled** (A/B with
-  identical matmul work, Phase A on vs off, `benchmarks/profile_phaseA.py`): Phase A is
-  **~57 %** of each stage's time; with it on, pto is **1.7–1.8× slower** than torch,
-  with it off pto is **0.72–0.78×** (i.e. *beats* torch — the matmul + fused output are
-  already ahead). **Fix:** extend `EinsumSkip` from "identity perm + `K==C`" to
-  "contraction axis innermost & contiguous + `K==C`", feeding `data0`/`data1` to the
-  Cube with the real per-batch base offset and per-row stride baked into the ND→NZ
-  `Shape`/`Stride` — decoded the same way `FUSE_OUT` (§2.9) decodes the strided *store*
-  base. Drops Phase A entirely for these stages (round-trip DMA **and** the Phase-A
-  dispatch), recovering ~57 %. The Left-operand partial-C0 ND→NZ quirk does not apply
-  (`K==C`, full blocks). Residual per-stage launch overhead is then a graph-capture
-  target (a separate dispatch-elim lever, ~2.4× at launch-bound small-`T`).
+- **NT strided-input matmul — LANDED (§2.11).** The GDN `kkt`/`wy_fast`/`chunk_o`
+  contractions now read both operands straight from the raw tensors (input0 row-strided
+  ND, input1 transposed via `Layout::DN`), dropping Phase A: **2.0–2.2× faster than torch**
+  and **3.4–3.8× faster than the prior Phase-A path**, bit-exact, no regressions. Residual
+  per-stage launch overhead is now the next GDN lever — a **graph-capture** target
+  (dispatch-elim, ~2.4× at launch-bound small-`T`). Possible NT follow-ons: multi-axis
+  free dims (only single-axis `free0`/`free1` are NT-eligible today) and a multi-axis
+  contiguous contraction block.
 - Lift the N-D batched-`TTRANS` `srcColStride==1` requirement (source whose
   second-innermost output axis is non-contiguous) — needs a non-contiguous gather,
   not a single strided DMA.

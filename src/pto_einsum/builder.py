@@ -34,6 +34,13 @@ _NO_FUSE = dict(
     out_batch_sizes=(), out_batch_strides=(),
 )
 
+# Neutral NT strided-input fields (non-NT default). The matmul path overrides these
+# when the contraction is innermost+contiguous on both inputs (see parse_recipe).
+_NO_NT = dict(
+    in_nt=0, in_n_batch=0, in0_row_stride=0, in1_col_stride=0,
+    in_batch_sizes=(), in0_batch_strides=(), in1_batch_strides=(),
+)
+
 class EinsumRecipe(TypedDict):
     in_transpose_idxs: tuple[tuple[int, ...], tuple[int, ...]]
     L0: int
@@ -77,6 +84,20 @@ class EinsumRecipe(TypedDict):
     out_n_batch: int
     out_batch_sizes: tuple
     out_batch_strides: tuple
+    # NT strided-input matmul (drop Phase A). Set when the contraction axis is the
+    # innermost (contiguous) axis of both inputs, free0/free1 are each a single axis,
+    # and the contraction is 16-aligned (K==C) with full output tiles: the Cube reads
+    # both operands straight from the raw tensors (input0 row-strided, input1 DN-
+    # transposed), skipping the input transposes. in0_row_stride / in1_col_stride are
+    # the source strides of free0 / free1; the batch arrays decode the flat batch index
+    # into each operand's source base. Neutral (in_nt=0) when not NT-eligible.
+    in_nt: int
+    in_n_batch: int
+    in0_row_stride: int
+    in1_col_stride: int
+    in_batch_sizes: tuple
+    in0_batch_strides: tuple
+    in1_batch_strides: tuple
 
 class EinsumBuilder:
     def __init__(self, equation: str, input_shapes: list[tuple[int, ...]], dtype: torch.dtype, device: str = "npu"):
@@ -177,6 +198,7 @@ class EinsumBuilder:
                 n_elem=prod(out_shape),
                 **_NO_BCAST,
                 **_NO_FUSE,
+                **_NO_NT,
             )
 
         s_in0, s_in1, s_out = set(in0), set(in1), set(out)
@@ -256,6 +278,48 @@ class EinsumBuilder:
         else:
             fuse_fields = dict(_NO_FUSE)
 
+        # NT strided-input matmul. When the contraction axis is the innermost
+        # (contiguous, stride 1) axis of BOTH inputs and free0/free1 are each a single
+        # axis, the Cube can read both operands straight from the raw tensors — input0
+        # as a row-strided ND tile, input1 transposed via a DN read — skipping Phase A's
+        # transpose entirely. Requires a 16-aligned contraction (K==C, so no contraction
+        # pad) and full output tiles (free dims tile-aligned, so no zero-pad row/col the
+        # strided read cannot synthesize). Composes with the fused output store above.
+        nt_eligible = (
+            os.getenv("EINSUM_DISABLE_NT", "0") == "0"
+            and len(contract) == 1 and len(invariant0) == 1 and len(invariant1) == 1
+            and in0[-1] == contract[0] and in1[-1] == contract[0]
+            and contract_size % 16 == 0
+        )
+        if nt_eligible:
+            pad16 = lambda x: (x + 15) // 16 * 16
+            tile = int(os.getenv("EINSUM_TILE_SIZE", "128"))
+            Mpad, Npad = pad16(invariant_size0), pad16(invariant_size1)
+            Mt, Nt = min(tile, Mpad), min(tile, Npad)
+            if Mpad % Mt != 0 or Npad % Nt != 0:
+                nt_eligible = False
+        if nt_eligible:
+            def _row_strides(shape):
+                s = [1] * len(shape)
+                run = 1
+                for p in range(len(shape) - 1, -1, -1):
+                    s[p] = run
+                    run *= shape[p]
+                return s
+            st0 = _row_strides(input_shape0)
+            st1 = _row_strides(input_shape1)
+            nt_fields = dict(
+                in_nt=1,
+                in_n_batch=len(inplace),
+                in0_row_stride=int(st0[in0.index(invariant0[0])]),
+                in1_col_stride=int(st1[in1.index(invariant1[0])]),
+                in_batch_sizes=tuple(int(s) for s in inplace_shape),
+                in0_batch_strides=tuple(int(st0[in0.index(ax)]) for ax in inplace),
+                in1_batch_strides=tuple(int(st1[in1.index(ax)]) for ax in inplace),
+            )
+        else:
+            nt_fields = dict(_NO_NT)
+
         # Note: the Cube kernel pads L0/L1/C up to fractal granularity internally
         # (see batched_matmul_kernel_standalone), so no multiple-of-16 restriction on
         # the logical dims is required here — arbitrary shapes (including degenerate
@@ -274,6 +338,7 @@ class EinsumBuilder:
             n_elem=prod(out_shape),
             **_NO_BCAST,
             **fuse_fields,
+            **nt_fields,
         )
 
     def _try_broadcast(self, in0, in1, out, shape0, shape1, out_shape):
@@ -353,6 +418,7 @@ class EinsumBuilder:
             bc_sizeB=size_b, bc_full_is_in0=full_is_in0,
             bc_outer_dims=outer_dims, bc_outer_bstride=outer_bstride,
             **_NO_FUSE,
+            **_NO_NT,
         )
 
     def transpose_config_gen(self, name: str, shape: tuple[int, ...], perm: tuple[int, ...]):
@@ -427,6 +493,11 @@ class EinsumBuilder:
         # (its loop runs over out_n_batch == 0).
         batch_sizes = self.recipe['out_batch_sizes'] or (0,)
         batch_strides = self.recipe['out_batch_strides'] or (0,)
+        # NT input batch arrays: same >=1 element rule (kernel reads them only when
+        # in_nt and loops over in_n_batch, which is 0 when non-NT batch-free).
+        in_batch_sizes = self.recipe['in_batch_sizes'] or (0,)
+        in0_batch_strides = self.recipe['in0_batch_strides'] or (0,)
+        in1_batch_strides = self.recipe['in1_batch_strides'] or (0,)
         return dict(
             tpose_inp0_name=tpose_inp0_name,
             tpose_inp1_name=tpose_inp1_name,
@@ -444,6 +515,14 @@ class EinsumBuilder:
             NB=len(batch_sizes),
             out_batch_sizes=', '.join(str(x) for x in batch_sizes),
             out_batch_strides=', '.join(str(x) for x in batch_strides),
+            in_nt=self.recipe['in_nt'],
+            in_n_batch=self.recipe['in_n_batch'],
+            in0_row_stride=self.recipe['in0_row_stride'],
+            in1_col_stride=self.recipe['in1_col_stride'],
+            NIB=len(in_batch_sizes),
+            in_batch_sizes=', '.join(str(x) for x in in_batch_sizes),
+            in0_batch_strides=', '.join(str(x) for x in in0_batch_strides),
+            in1_batch_strides=', '.join(str(x) for x in in1_batch_strides),
         )
 
     def parse_equation(self):

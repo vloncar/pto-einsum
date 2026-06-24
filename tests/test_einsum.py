@@ -72,6 +72,15 @@ from pto_einsum import einsum, EinsumBuilder
     # full 128 tiles, contract d=64 -> nKd==1 -> pipelined loop with FUSE_OUT.
     ("bshd, bthd -> bsht", (2, 128, 16, 64), (2, 128, 16, 64)),
 
+    # --- NT strided-input matmul (contraction innermost+contiguous both inputs) ---
+    # The Cube reads both operands straight from the raw tensors (input0 row-strided,
+    # input1 DN-transposed), dropping Phase A entirely. These are the GDN attention
+    # contractions; free1 innermost in res so the fused output store composes with NT.
+    ("bihd, bjhd -> bihj", (2, 128, 16, 128), (2, 128, 16, 128)),  # kkt: NT + fused out, full 128^3
+    ("bihd, bjhd -> bihj", (4, 128, 4, 128), (4, 128, 4, 128)),    # fewer heads
+    ("bnd, bmd -> bnm", (8, 128, 64), (8, 128, 64)),               # single batch axis, K=64==C
+    ("bihd, bjhd -> bihj", (2, 64, 4, 32), (2, 96, 4, 32)),        # asymmetric i!=j, sub-tile + K=32
+
     # --- non-16-aligned contraction (K != C): K-padded transpose destinations ---
     # j=20 -> K=32: identity-copy inputs (ij,jk) and a=20 -> K=32: 2D-TTRANS (ai,ja).
     ("ij, jk -> ik", (32, 20), (20, 128)),
@@ -247,6 +256,38 @@ def test_pipelined_matmul_deterministic(dtype):
         out = runner(inp0, inp1)
         # Bit-exact: same kernel, same input -> identical output, every time.
         assert torch.equal(out, ref), "pipelined matmul is non-deterministic (suspect a cross-tile race)"
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_nt_strided_input_deterministic(dtype):
+    # NT strided-input path (Phase A dropped: input0 read row-strided, input1 read
+    # transposed via Layout::DN straight from GM). The kkt contraction routes NT through
+    # the cross-tile pipelined loop (batch (b,h)=2*16=32 tiles >= MIN_TILES, nKd==1) and
+    # also fires the fused output store -- so this pins both that the NT strided read is
+    # bit-exact vs torch AND that adding NT addressing to the pipelined loop did not
+    # introduce a cross-tile race (a strided GM read changes only the load addresses, the
+    # WAR/RAW flag ordering is unchanged, but verify it directly).
+    if TEST_DEVICE == "cpu":
+        pytest.skip("NT strided-input Cube path is NPU-only")
+
+    equation = "bihd, bjhd -> bihj"
+    shape0, shape1 = (2, 128, 16, 128), (2, 128, 16, 128)
+    builder = EinsumBuilder(equation, [shape0, shape1], dtype, device=TEST_DEVICE)
+    runner = builder.build()
+    assert "in_nt = 1" in builder.cpp_code, "kkt-shaped contraction should take the NT path"
+
+    inp0 = torch.rand(shape0, dtype=dtype, device=TEST_DEVICE)
+    inp1 = torch.rand(shape1, dtype=dtype, device=TEST_DEVICE)
+
+    ref = runner(inp0, inp1).clone()
+    expected = torch.einsum(equation, inp0, inp1).to(dtype=torch.float32)
+    rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
+    torch.testing.assert_close(ref, expected, rtol=rtol, atol=atol)
+
+    for _ in range(8):
+        out = runner(inp0, inp1)
+        assert torch.equal(out, ref), "NT strided-input matmul is non-deterministic (suspect a cross-tile race)"
+    builder.cleanup()
 
 
 def test_validation_errors():

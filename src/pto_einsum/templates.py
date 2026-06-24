@@ -36,6 +36,24 @@ einsum_config_template = """struct config_einsum {{
     static constexpr unsigned out_n_batch = {out_n_batch};
     static constexpr unsigned out_batch_sizes[{NB}] = {{{out_batch_sizes}}};
     static constexpr unsigned out_batch_strides[{NB}] = {{{out_batch_strides}}};
+
+    // NT strided-input matmul (drop Phase A). When the contraction axis is the
+    // innermost (contiguous) axis of BOTH inputs and free0/free1 are each a single
+    // axis (and K==C, full tiles), the Cube reads both operands straight from the raw
+    // tensors in their natural strided layout — input0 as a row-strided ND tile,
+    // input1 transposed via a DN read (the flash Q@K^T pattern) — eliminating Phase A's
+    // transpose round-trip. in_nt is 0/1; in0_row_stride / in1_col_stride are the
+    // source element strides of free0 (input0) / free1 (input1); the contraction stride
+    // is 1 by the gate; the batch arrays decode the flat batch index into each operand's
+    // source base (inplace-axis sizes shared, per-operand source strides). All
+    // zero/neutral when not NT-eligible.
+    static constexpr unsigned in_nt = {in_nt};
+    static constexpr unsigned in_n_batch = {in_n_batch};
+    static constexpr unsigned in0_row_stride = {in0_row_stride};
+    static constexpr unsigned in1_col_stride = {in1_col_stride};
+    static constexpr unsigned in_batch_sizes[{NIB}] = {{{in_batch_sizes}}};
+    static constexpr unsigned in0_batch_strides[{NIB}] = {{{in0_batch_strides}}};
+    static constexpr unsigned in1_batch_strides[{NIB}] = {{{in1_batch_strides}}};
 }};
 """
 elementwise_config_template = """struct config_elementwise {{

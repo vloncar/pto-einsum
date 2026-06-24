@@ -79,6 +79,26 @@ struct FusibleOutputPerm {
     static constexpr unsigned n_batch = CONFIG_T::out_n_batch;        // # inplace axes
 };
 
+// NT strided-input gate. When the host marks the config NT-eligible (contraction axis
+// innermost+contiguous on both inputs, single free0/free1 axes — see builder.parse_recipe),
+// the matmul reads both operands straight from the raw tensors in their natural strided
+// layout, dropping Phase A: input0 as a row-strided ND tile (free0 row stride
+// `row_stride0`, contraction contiguous), input1 transposed via a DN read (contraction
+// contiguous == K innermost, free1 col stride `col_stride1`). The flat batch index decodes
+// into each operand's source base via the inplace-axis sizes + per-operand source strides.
+// Re-confirms the geometry preconditions the strided read needs (K==C so no contraction
+// pad; full tiles so no zero-pad row/col to synthesize) so a host/device mismatch is a
+// compile-time gate, never a silent misread. Composes with FusibleOutputPerm (output side).
+template <typename CONFIG_T>
+struct NtInput {
+    using G = MatmulGeom<CONFIG_T>;
+    static constexpr bool value = (CONFIG_T::in_nt != 0u)
+                                  && (G::K == G::C) && !G::A_PADDED && !G::B_PADDED;
+    static constexpr unsigned n_batch = CONFIG_T::in_n_batch;
+    static constexpr unsigned row_stride0 = CONFIG_T::in0_row_stride;  // src stride of free0 (input0)
+    static constexpr unsigned col_stride1 = CONFIG_T::in1_col_stride;  // src stride of free1 (input1)
+};
+
 // One output tile, basic per-Kt schedule: contract the K-tile range
 // [kStart, kStart+kCount) of tile `t` and store the result. This is the split-K
 // tile (the plain schedule uses the deeper-pipelined matmul_one_tile_deep below).
@@ -353,7 +373,7 @@ static_assert(!MatmulPipeline<float, Cfg<200, 128, 128, 64, 128>>::PIPELINE_TILE
 //      GM->L1 load under chunk c's compute.
 // Each tile is self-contained (inits its event flags, drains them before the
 // store), so the scheduler can hand tiles to cores in any order.
-template <typename data_T, typename CONFIG_T, bool FUSE_OUT = false>
+template <typename data_T, typename CONFIG_T, bool FUSE_OUT = false, bool NT_IN = false>
 AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const data_T* ws1,
                                         __gm__ float* ws_res, unsigned t) {
         using G = MatmulGeom<CONFIG_T>;
@@ -383,14 +403,28 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
         constexpr unsigned nKd = K / Kd;   // L1 chunk count
         constexpr unsigned nP  = Kd / Kq;  // L0 phases per chunk
 
+        // NT strided-input: read both operands straight from the raw tensors (no Phase A).
+        // A is a row-strided ND tile (free0 row stride NtIn::row_stride0, contraction
+        // contiguous); B is read transposed via Layout::DN (contraction contiguous == K
+        // innermost, free1 col stride NtIn::col_stride1, SLayout::ColMajor Mat tile). The
+        // default (NT_IN=false) path is the canonical contiguous ws0/ws1 read, unchanged.
+        using NtIn = NtInput<CONFIG_T>;
+        constexpr unsigned A_ROW_STRIDE = NT_IN ? NtIn::row_stride0 : K;
+        constexpr unsigned B_K_STRIDE   = NT_IN ? 1u : Bcols;
+        constexpr unsigned B_N_STRIDE   = NT_IN ? NtIn::col_stride1 : 1u;
+        constexpr pto::Layout B_LAYOUT  = NT_IN ? pto::Layout::DN : pto::Layout::ND;
+        constexpr pto::BLayout B_BLAYOUT = NT_IN ? pto::BLayout::RowMajor : pto::BLayout::ColMajor;
+        constexpr pto::SLayout B_SLAYOUT = NT_IN ? pto::SLayout::ColMajor : pto::SLayout::RowMajor;
+
         using ShapeA = pto::Shape<1, 1, 1, -1, Kd>;
-        using StrideA = pto::Stride<1, 1, 1, K, 1>;
+        using StrideA = pto::Stride<1, 1, 1, A_ROW_STRIDE, 1>;
         using ShapeB = pto::Shape<1, 1, 1, Kd, -1>;
-        using StrideB = pto::Stride<1, 1, 1, Bcols, 1>;
+        using StrideB = pto::Stride<1, 1, 1, B_K_STRIDE, B_N_STRIDE>;
         using ShapeC = pto::Shape<1, 1, 1, -1, -1>;
         using StrideC = pto::Stride<1, 1, 1, ROW_STRIDE, 1>;
+        using GlobalB = pto::GlobalTensor<data_T, ShapeB, StrideB, B_LAYOUT>;
         using MatTileA = pto::Tile<pto::TileType::Mat, data_T, Mt, Kd, pto::BLayout::ColMajor, -1, -1, pto::SLayout::RowMajor, 512>;
-        using MatTileB = pto::Tile<pto::TileType::Mat, data_T, Kd, Nt, pto::BLayout::ColMajor, -1, -1, pto::SLayout::RowMajor, 512>;
+        using MatTileB = pto::Tile<pto::TileType::Mat, data_T, Kd, Nt, B_BLAYOUT, -1, -1, B_SLAYOUT, 512>;
         using LeftTileA = pto::TileLeft<data_T, Mt, Kq, -1, -1>;
         using RightTileB = pto::TileRight<data_T, Kq, Nt, -1, -1>;
         using AccTileC = pto::TileAcc<float, Mt, Nt, -1, -1>;
@@ -440,8 +474,28 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
         b_l0[1].SetValidRow(Kq);     b_l0[1].SetValidCol(loadN);
         c_l0.SetValidRow(validM);    c_l0.SetValidCol(validN);
 
-        const __gm__ data_T* aBase = ws0 + i * Arows * K + row0 * K;
-        const __gm__ data_T* bBase = ws1 + i * K * Bcols + col0;
+        // Operand source bases. NT: decode the flat batch index `i` into each operand's
+        // source base (Σ idx_k·src_stride_k over the inplace axes), then add the tile's
+        // row0/col0 corner with the strided free dims (contraction is contiguous, so the
+        // K offset added at load time is +k0 for both). Default: the canonical contiguous
+        // ws0/ws1 layout (i·Arows·K + row0·K  /  i·K·Bcols + col0), byte-for-byte unchanged.
+        const __gm__ data_T* aBase;
+        const __gm__ data_T* bBase;
+        if constexpr (NT_IN) {
+            unsigned baseA = 0, baseB = 0, rr = i;
+            #pragma unroll
+            for (int k = int(NtIn::n_batch) - 1; k >= 0; --k) {
+                unsigned idx = rr % CONFIG_T::in_batch_sizes[k];
+                baseA += idx * CONFIG_T::in0_batch_strides[k];
+                baseB += idx * CONFIG_T::in1_batch_strides[k];
+                rr /= CONFIG_T::in_batch_sizes[k];
+            }
+            aBase = ws0 + baseA + size_t(row0) * A_ROW_STRIDE;
+            bBase = ws1 + baseB + size_t(col0) * B_N_STRIDE;
+        } else {
+            aBase = ws0 + i * Arows * K + row0 * K;
+            bBase = ws1 + i * K * Bcols + col0;
+        }
 
         // Init: both L0 ping-pong buffers free, both L1 A/B buffers free.
         set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
@@ -454,7 +508,7 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
         // Load chunk 0 into buffer 0 (A on event lanes 0/1, B on 2/3).
         {
             pto::GlobalTensor<data_T, ShapeA, StrideA> ag(const_cast<__gm__ data_T*>(aBase), ShapeA(loadM));
-            pto::GlobalTensor<data_T, ShapeB, StrideB> bg(const_cast<__gm__ data_T*>(bBase), ShapeB(loadN));
+            GlobalB bg(const_cast<__gm__ data_T*>(bBase), ShapeB(loadN));
             wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
             TLOAD(a_l1[0], ag);
             set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
@@ -475,8 +529,11 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
                 event_t aLdN = nb ? EVENT_ID1 : EVENT_ID0;
                 event_t bLdN = nb ? EVENT_ID3 : EVENT_ID2;
                 unsigned k0 = (c + 1) * Kd;
+                // Contraction K-offset: contiguous for NT (stride 1 -> +k0), row-strided
+                // for the canonical layout (B's K stride is Bcols -> +k0*Bcols).
+                const __gm__ data_T* bChunk = NT_IN ? (bBase + k0) : (bBase + size_t(k0) * Bcols);
                 pto::GlobalTensor<data_T, ShapeA, StrideA> ag(const_cast<__gm__ data_T*>(aBase + k0), ShapeA(loadM));
-                pto::GlobalTensor<data_T, ShapeB, StrideB> bg(const_cast<__gm__ data_T*>(bBase + size_t(k0) * Bcols), ShapeB(loadN));
+                GlobalB bg(const_cast<__gm__ data_T*>(bChunk), ShapeB(loadN));
                 wait_flag(PIPE_MTE1, PIPE_MTE2, aLdN);
                 TLOAD(a_l1[nb], ag);
                 set_flag(PIPE_MTE2, PIPE_MTE1, aLdN);
@@ -565,7 +622,7 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
 //   MTE1->M     extract done (RAW: matmul waits its extract) -- ID0, set/wait adjacent
 //   M->FIX      matmul done (RAW: the store waits this tile's matmuls)
 //   FIX->M      accumulator free (WAR: tile t+2 reuses c_l0[q] after t's store)
-template <typename data_T, typename CONFIG_T, bool FUSE_OUT = false>
+template <typename data_T, typename CONFIG_T, bool FUSE_OUT = false, bool NT_IN = false>
 AICORE inline void matmul_tile_loop_pipelined(__gm__ const data_T* ws0, __gm__ const data_T* ws1,
                                               __gm__ float* ws_res, unsigned start, unsigned end) {
         using G = MatmulGeom<CONFIG_T>;
@@ -591,14 +648,26 @@ AICORE inline void matmul_tile_loop_pipelined(__gm__ const data_T* ws0, __gm__ c
 
         if (start >= end) return;
 
+        // NT strided-input (see matmul_one_tile_deep): A row-strided ND, B transposed via
+        // Layout::DN. nKd==1 here so there is no within-tile K-chunk offset. Default path
+        // (NT_IN=false) is the canonical contiguous ws0/ws1 read, byte-for-byte unchanged.
+        using NtIn = NtInput<CONFIG_T>;
+        constexpr unsigned A_ROW_STRIDE = NT_IN ? NtIn::row_stride0 : K;
+        constexpr unsigned B_K_STRIDE   = NT_IN ? 1u : Bcols;
+        constexpr unsigned B_N_STRIDE   = NT_IN ? NtIn::col_stride1 : 1u;
+        constexpr pto::Layout B_LAYOUT  = NT_IN ? pto::Layout::DN : pto::Layout::ND;
+        constexpr pto::BLayout B_BLAYOUT = NT_IN ? pto::BLayout::RowMajor : pto::BLayout::ColMajor;
+        constexpr pto::SLayout B_SLAYOUT = NT_IN ? pto::SLayout::ColMajor : pto::SLayout::RowMajor;
+
         using ShapeA = pto::Shape<1, 1, 1, -1, Kd>;
-        using StrideA = pto::Stride<1, 1, 1, K, 1>;
+        using StrideA = pto::Stride<1, 1, 1, A_ROW_STRIDE, 1>;
         using ShapeB = pto::Shape<1, 1, 1, Kd, -1>;
-        using StrideB = pto::Stride<1, 1, 1, Bcols, 1>;
+        using StrideB = pto::Stride<1, 1, 1, B_K_STRIDE, B_N_STRIDE>;
         using ShapeC = pto::Shape<1, 1, 1, -1, -1>;
         using StrideC = pto::Stride<1, 1, 1, ROW_STRIDE, 1>;
+        using GlobalB = pto::GlobalTensor<data_T, ShapeB, StrideB, B_LAYOUT>;
         using MatTileA = pto::Tile<pto::TileType::Mat, data_T, Mt, Kd, pto::BLayout::ColMajor, -1, -1, pto::SLayout::RowMajor, 512>;
-        using MatTileB = pto::Tile<pto::TileType::Mat, data_T, Kd, Nt, pto::BLayout::ColMajor, -1, -1, pto::SLayout::RowMajor, 512>;
+        using MatTileB = pto::Tile<pto::TileType::Mat, data_T, Kd, Nt, B_BLAYOUT, -1, -1, B_SLAYOUT, 512>;
         using LeftTileA = pto::TileLeft<data_T, Mt, Kq, -1, -1>;
         using RightTileB = pto::TileRight<data_T, Kq, Nt, -1, -1>;
         using AccTileC = pto::TileAcc<float, Mt, Nt, -1, -1>;
@@ -660,12 +729,27 @@ AICORE inline void matmul_tile_loop_pipelined(__gm__ const data_T* ws0, __gm__ c
             unsigned t = start, q = t & 1;
             unsigned i = t / tiles_per_batch, rem = t % tiles_per_batch;
             unsigned row0 = (rem / nN) * Mt, col0 = (rem % nN) * Nt;
-            const __gm__ data_T* aBase = ws0 + i * Arows * K + row0 * K;
-            const __gm__ data_T* bBase = ws1 + i * K * Bcols + col0;
+            const __gm__ data_T* aBase;
+            const __gm__ data_T* bBase;
+            if constexpr (NT_IN) {
+                unsigned baseA = 0, baseB = 0, rr = i;
+                #pragma unroll
+                for (int k = int(NtIn::n_batch) - 1; k >= 0; --k) {
+                    unsigned idx = rr % CONFIG_T::in_batch_sizes[k];
+                    baseA += idx * CONFIG_T::in0_batch_strides[k];
+                    baseB += idx * CONFIG_T::in1_batch_strides[k];
+                    rr /= CONFIG_T::in_batch_sizes[k];
+                }
+                aBase = ws0 + baseA + size_t(row0) * A_ROW_STRIDE;
+                bBase = ws1 + baseB + size_t(col0) * B_N_STRIDE;
+            } else {
+                aBase = ws0 + i * Arows * K + row0 * K;
+                bBase = ws1 + i * K * Bcols + col0;
+            }
             event_t aF = q ? EVENT_ID1 : EVENT_ID0;
             event_t bF = q ? EVENT_ID3 : EVENT_ID2;
             pto::GlobalTensor<data_T, ShapeA, StrideA> ag(const_cast<__gm__ data_T*>(aBase), ShapeA(Mt));
-            pto::GlobalTensor<data_T, ShapeB, StrideB> bg(const_cast<__gm__ data_T*>(bBase), ShapeB(Nt));
+            GlobalB bg(const_cast<__gm__ data_T*>(bBase), ShapeB(Nt));
             wait_flag(PIPE_MTE1, PIPE_MTE2, aF);
             TLOAD(a_l1[q], ag);
             set_flag(PIPE_MTE2, PIPE_MTE1, aF);
@@ -682,12 +766,27 @@ AICORE inline void matmul_tile_loop_pipelined(__gm__ const data_T* ws0, __gm__ c
                 unsigned tn = t + 1, qn = tn & 1;
                 unsigned i = tn / tiles_per_batch, rem = tn % tiles_per_batch;
                 unsigned row0 = (rem / nN) * Mt, col0 = (rem % nN) * Nt;
-                const __gm__ data_T* aBase = ws0 + i * Arows * K + row0 * K;
-                const __gm__ data_T* bBase = ws1 + i * K * Bcols + col0;
+                const __gm__ data_T* aBase;
+                const __gm__ data_T* bBase;
+                if constexpr (NT_IN) {
+                    unsigned baseA = 0, baseB = 0, rr = i;
+                    #pragma unroll
+                    for (int k = int(NtIn::n_batch) - 1; k >= 0; --k) {
+                        unsigned idx = rr % CONFIG_T::in_batch_sizes[k];
+                        baseA += idx * CONFIG_T::in0_batch_strides[k];
+                        baseB += idx * CONFIG_T::in1_batch_strides[k];
+                        rr /= CONFIG_T::in_batch_sizes[k];
+                    }
+                    aBase = ws0 + baseA + size_t(row0) * A_ROW_STRIDE;
+                    bBase = ws1 + baseB + size_t(col0) * B_N_STRIDE;
+                } else {
+                    aBase = ws0 + i * Arows * K + row0 * K;
+                    bBase = ws1 + i * K * Bcols + col0;
+                }
                 event_t aF = qn ? EVENT_ID1 : EVENT_ID0;
                 event_t bF = qn ? EVENT_ID3 : EVENT_ID2;
                 pto::GlobalTensor<data_T, ShapeA, StrideA> ag(const_cast<__gm__ data_T*>(aBase), ShapeA(Mt));
-                pto::GlobalTensor<data_T, ShapeB, StrideB> bg(const_cast<__gm__ data_T*>(bBase), ShapeB(Nt));
+                GlobalB bg(const_cast<__gm__ data_T*>(bBase), ShapeB(Nt));
                 wait_flag(PIPE_MTE1, PIPE_MTE2, aF);
                 TLOAD(a_l1[qn], ag);
                 set_flag(PIPE_MTE2, PIPE_MTE1, aF);
@@ -765,7 +864,7 @@ AICORE inline void matmul_tile_loop_pipelined(__gm__ const data_T* ws0, __gm__ c
 // guards with `if constexpr (DAV_CUBE)` and supplies the block index/count.
 // SPLITK enables the split-K schedule (see batched_matmul_inline body); it is off
 // for the standalone matmul and on only for fused configs with idle cores.
-template <typename data_T, typename CONFIG_T, bool SPLITK = false, bool FUSE_OUT = false>
+template <typename data_T, typename CONFIG_T, bool SPLITK = false, bool FUSE_OUT = false, bool NT_IN = false>
 AICORE inline void batched_matmul_inline(__gm__ const data_T* ws0, __gm__ const data_T* ws1,
                                          __gm__ float* ws_res, unsigned block_idx, unsigned block_num) {
         using G = MatmulGeom<CONFIG_T>;
@@ -818,10 +917,10 @@ AICORE inline void batched_matmul_inline(__gm__ const data_T* ws0, __gm__ const 
         unsigned start = block_idx * chunk;
         unsigned end = (start + chunk) < total_tiles ? (start + chunk) : total_tiles;
         if constexpr (MatmulPipeline<data_T, CONFIG_T>::PIPELINE_TILES) {
-            matmul_tile_loop_pipelined<data_T, CONFIG_T, FUSE_OUT>(ws0, ws1, ws_res, start, end);
+            matmul_tile_loop_pipelined<data_T, CONFIG_T, FUSE_OUT, NT_IN>(ws0, ws1, ws_res, start, end);
         } else {
             for (unsigned t = start; t < end; t++) {
-                matmul_one_tile_deep<data_T, CONFIG_T, FUSE_OUT>(ws0, ws1, ws_res, t);
+                matmul_one_tile_deep<data_T, CONFIG_T, FUSE_OUT, NT_IN>(ws0, ws1, ws_res, t);
             }
         }
 }

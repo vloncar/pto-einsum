@@ -79,13 +79,22 @@ __global__ AICORE void einsum_fused_kernel(
     // read straight from data0/data1; their Phase A transpose is skipped below.
     constexpr bool SKIP0 = EinsumSkip<CONFIG_T>::inp0;
     constexpr bool SKIP1 = EinsumSkip<CONFIG_T>::inp1;
+    // NT strided-input: the contraction is innermost+contiguous on both inputs, so the
+    // matmul reads them straight from data0/data1 in their natural strided layout (A
+    // row-strided, B transposed via DN) — dropping BOTH input transposes. RD0/RD1 are
+    // the read-direct flags (skip Phase A and read the raw tensor) for each operand,
+    // covering the identity-skip and NT cases uniformly.
+    constexpr bool NT_IN = NtInput<CONFIG_T>::value;
+    constexpr bool RD0 = SKIP0 || NT_IN;
+    constexpr bool RD1 = SKIP1 || NT_IN;
     // Split-K is enabled only when the output is identity (so the matmul target is
     // `res`, which the host pre-zeros for these configs — see builder._splitk so the
     // cores can atomic-add into it), there is K to split, and the output-tile grid
     // is small enough to leave cores idle on the plain schedule. The runtime
     // ksplit (>=2) gate inside collapses it to the plain path on small parts.
     constexpr bool SPLITK_ELIGIBLE =
-        OUT_IDENTITY && (MatmulGeom<CONFIG_T>::nK >= 2) && (MatmulGeom<CONFIG_T>::total_tiles < 16);
+        OUT_IDENTITY && (MatmulGeom<CONFIG_T>::nK >= 2) && (MatmulGeom<CONFIG_T>::total_tiles < 16)
+        && !NT_IN;
 
     if constexpr (DAV_VEC) {
 
@@ -103,8 +112,9 @@ __global__ AICORE void einsum_fused_kernel(
         // input0's transpose output is [.., contract]; pad its innermost contract
         // dim C up to the fractal width K so the Cube reads a full K-wide A. The
         // pad is uniform across all I*L0 rows, so any batch count works directly.
-        // SKIP0: ws0 would be a byte-identical copy of data0 — read data0 directly.
-        if constexpr (!SKIP0)
+        // RD0: ws0 would be a byte-identical copy (SKIP0) or the NT path reads data0
+        // strided — either way Phase A's transpose is redundant, read data0 directly.
+        if constexpr (!RD0)
             transpose_inline<data_T, typename CONFIG_T::tpose_inp0_config, C, K>(data0, ws0, lane, nlanes);
 
         // input1's contract dim is the per-batch row count. For K==C, or a single
@@ -113,8 +123,9 @@ __global__ AICORE void einsum_fused_kernel(
         // batch's C valid rows must land at the front of its K-row slot (stride
         // K*L1) — a contiguous write would mis-stride the batches. An identity input1
         // is the contiguous repack (batched_pad_copy_inline); a non-identity input1
-        // transposes *and* row-pads (transpose_inline_rowpad). SKIP1: ws1 == data1.
-        if constexpr (!SKIP1) {
+        // transposes *and* row-pads (transpose_inline_rowpad). RD1: ws1 == data1 (skip)
+        // or the NT path reads data1 transposed (DN) straight from GM — no Phase A.
+        if constexpr (!RD1) {
             if constexpr (K != C && I > 1) {
                 if constexpr (IsIdentityPerm<typename CONFIG_T::tpose_inp1_config>::value) {
                     batched_pad_copy_inline<data_T>(data1, ws1, I, C, L1, K * L1, lane, nlanes);
@@ -146,9 +157,9 @@ __global__ AICORE void einsum_fused_kernel(
         // into the pre-zeroed res. The matmul reads each input from the workspace, or
         // straight from the raw tensor when its copy was skipped (SKIP0/SKIP1).
         __gm__ float* mm_out = OUT_DIRECT ? res : ws_res;
-        __gm__ const data_T* mmA = SKIP0 ? data0 : static_cast<__gm__ const data_T*>(ws0);
-        __gm__ const data_T* mmB = SKIP1 ? data1 : static_cast<__gm__ const data_T*>(ws1);
-        batched_matmul_inline<data_T, CONFIG_T, SPLITK_ELIGIBLE, FUSE_OUT>(mmA, mmB, mm_out, get_block_idx(), get_block_num());
+        __gm__ const data_T* mmA = RD0 ? data0 : static_cast<__gm__ const data_T*>(ws0);
+        __gm__ const data_T* mmB = RD1 ? data1 : static_cast<__gm__ const data_T*>(ws1);
+        batched_matmul_inline<data_T, CONFIG_T, SPLITK_ELIGIBLE, FUSE_OUT, NT_IN>(mmA, mmB, mm_out, get_block_idx(), get_block_num());
     }
 #endif  // EINSUM_PHASE_STOP >= 2
 
@@ -197,13 +208,13 @@ template <typename data_T, typename CONFIG_T>
 void* einsum_setup(void* stream = nullptr) {
     constexpr unsigned C = CONFIG_T::n_contract;
     constexpr unsigned K = (C + 15) / 16 * 16;
-    // Skipped inputs (identity perm + K==C) are read straight from data0/data1, so
-    // their workspace region is neither allocated nor copied into. Note K!=C forces
-    // both SKIP flags false, so the pad-zeroing path below always has its buffers.
-    constexpr bool SKIP0 = EinsumSkip<CONFIG_T>::inp0;
-    constexpr bool SKIP1 = EinsumSkip<CONFIG_T>::inp1;
-    const size_t ws0_elems = SKIP0 ? 0 : einsum_ws0_elems<data_T, CONFIG_T>();
-    const size_t ws1_elems = SKIP1 ? 0 : einsum_ws1_elems<data_T, CONFIG_T>();
+    // Inputs read straight from data0/data1 — identity-skip (perm + K==C) or NT (strided
+    // read) — occupy no workspace region. Note K!=C forces every read-direct flag false,
+    // so the pad-zeroing path below always has its buffers.
+    constexpr bool RD0 = EinsumSkip<CONFIG_T>::inp0 || NtInput<CONFIG_T>::value;
+    constexpr bool RD1 = EinsumSkip<CONFIG_T>::inp1 || NtInput<CONFIG_T>::value;
+    const size_t ws0_elems = RD0 ? 0 : einsum_ws0_elems<data_T, CONFIG_T>();
+    const size_t ws1_elems = RD1 ? 0 : einsum_ws1_elems<data_T, CONFIG_T>();
     const size_t ws0_bytes = sizeof(data_T) * ws0_elems;
     const size_t ws1_bytes = sizeof(data_T) * ws1_elems;
     // Identity or fused output writes straight to res, so ws_res is never read — don't
@@ -244,11 +255,12 @@ void einsum_exec(const data_T* data0, const data_T* data1, float* res,
                  void* workspace, void* stream = nullptr) {
     int64_t core_num = cached_core_num();
 
-    // Match einsum_setup's layout: skipped inputs occupy no workspace region.
-    constexpr bool SKIP0 = EinsumSkip<CONFIG_T>::inp0;
-    constexpr bool SKIP1 = EinsumSkip<CONFIG_T>::inp1;
-    const size_t ws0_elems = SKIP0 ? 0 : einsum_ws0_elems<data_T, CONFIG_T>();
-    const size_t ws1_elems = SKIP1 ? 0 : einsum_ws1_elems<data_T, CONFIG_T>();
+    // Match einsum_setup's layout: read-direct inputs (identity-skip or NT) occupy no
+    // workspace region.
+    constexpr bool RD0 = EinsumSkip<CONFIG_T>::inp0 || NtInput<CONFIG_T>::value;
+    constexpr bool RD1 = EinsumSkip<CONFIG_T>::inp1 || NtInput<CONFIG_T>::value;
+    const size_t ws0_elems = RD0 ? 0 : einsum_ws0_elems<data_T, CONFIG_T>();
+    const size_t ws1_elems = RD1 ? 0 : einsum_ws1_elems<data_T, CONFIG_T>();
 
     data_T* ws0 = reinterpret_cast<data_T*>(workspace);
     data_T* ws1 = reinterpret_cast<data_T*>(ws0 + ws0_elems);
