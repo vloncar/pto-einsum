@@ -126,6 +126,35 @@ BENCHMARKS = {
         "sizes": [8, 16, 32, 64],
         "make": lambda a: ((a, 64, 128), (128, 256), str(a)),
     },
+    # --- direct strided-input reads (Phase A dropped): the GDN attention contraction
+    # shapes, swept by the folded batch count (b = B*n_chunks). These fire the same fast
+    # paths the complex/gdn example uses, but in the base suite so they are exercised
+    # standalone: kkt -> NT (in_nt=1, B DN-transposed), wy_fast -> NN-strided (in_nt=2,
+    # B ND strided-K), chunk_h kv -> TN (in_nt=3, A DN-transposed). H=16, chunk=head=128.
+    "gdn-kkt-nt": {
+        "name": "GDN kkt (NT read)",
+        "equation": "bihd, bjhd -> bihj",
+        "dtype": torch.float32,
+        "param": "Batch (chunk=128, H=16, d=128)",
+        "sizes": [8, 16, 32, 64],
+        "make": lambda b: ((b, 128, 16, 128), (b, 128, 16, 128), str(b)),
+    },
+    "gdn-wy-fast-nn": {
+        "name": "GDN wy_fast (NN-strided read)",
+        "equation": "bihj, bjhd -> bihd",
+        "dtype": torch.float32,
+        "param": "Batch (chunk=128, H=16, d=128)",
+        "sizes": [8, 16, 32, 64],
+        "make": lambda b: ((b, 128, 16, 128), (b, 128, 16, 128), str(b)),
+    },
+    "gdn-chunk-h-tn": {
+        "name": "GDN chunk_h kv (TN read)",
+        "equation": "bvhd, bvhe -> bhde",
+        "dtype": torch.float32,
+        "param": "Batch (chunk=128, H=16, d=128)",
+        "sizes": [8, 16, 32, 64],
+        "make": lambda b: ((b, 128, 16, 128), (b, 128, 16, 128), str(b)),
+    },
     # Non-16-aligned contraction (C = N-6 -> K padded up), exercising the
     # K-padded transpose destinations.
     "unaligned": {
