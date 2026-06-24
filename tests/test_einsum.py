@@ -89,6 +89,12 @@ from pto_einsum import einsum, EinsumBuilder
     ("bvhd, bhde -> bvhe", (4, 128, 8, 64), (4, 8, 64, 64)),       # chunk_o inter: B contiguous K (e=N)
     ("bnj, bjm -> bnm", (8, 128, 128), (8, 128, 64)),              # single batch axis, contiguous B
 
+    # --- TN direct input (contraction NOT innermost on input0 -> A read transposed via
+    # Layout::DN, free0 contiguous + contraction strided; B NN-strided). GDN chunk_h kv.
+    ("bvhd, bvhe -> bhde", (2, 128, 16, 128), (2, 128, 16, 128)),  # chunk_h kv: TN + fused out, 128^3
+    ("bvhd, bvhe -> bhde", (4, 128, 4, 64), (4, 128, 4, 64)),      # fewer heads, smaller free dims
+    ("vnd, vne -> nde", (128, 8, 64), (128, 8, 64)),               # single batch axis (n)
+
     # --- non-16-aligned contraction (K != C): K-padded transpose destinations ---
     # j=20 -> K=32: identity-copy inputs (ij,jk) and a=20 -> K=32: 2D-TTRANS (ai,ja).
     ("ij, jk -> ik", (32, 20), (20, 128)),
@@ -325,6 +331,36 @@ def test_nn_strided_input_deterministic(dtype):
     for _ in range(8):
         out = runner(inp0, inp1)
         assert torch.equal(out, ref), "NN-strided direct-input matmul is non-deterministic (suspect a cross-tile race)"
+    builder.cleanup()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_tn_strided_input_deterministic(dtype):
+    # TN direct-input path (Phase A dropped: contraction v is the OUTER/strided axis on
+    # both inputs, so input0 is read TRANSPOSED via Layout::DN -- free0 d contiguous, K=v
+    # strided -- paired with the NN-strided input1 read). The chunk_h kv contraction routes
+    # through the cross-tile pipelined loop and fires the fused output store. Pins that the
+    # left-operand DN transposed read is bit-exact vs torch AND introduces no cross-tile race.
+    if TEST_DEVICE == "cpu":
+        pytest.skip("TN direct-input Cube path is NPU-only")
+
+    equation = "bvhd, bvhe -> bhde"
+    shape0, shape1 = (2, 128, 16, 128), (2, 128, 16, 128)
+    builder = EinsumBuilder(equation, [shape0, shape1], dtype, device=TEST_DEVICE)
+    runner = builder.build()
+    assert "in_nt = 3" in builder.cpp_code, "chunk_h-shaped contraction should take the TN path"
+
+    inp0 = torch.rand(shape0, dtype=dtype, device=TEST_DEVICE)
+    inp1 = torch.rand(shape1, dtype=dtype, device=TEST_DEVICE)
+
+    ref = runner(inp0, inp1).clone()
+    expected = torch.einsum(equation, inp0, inp1).to(dtype=torch.float32)
+    rtol, atol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
+    torch.testing.assert_close(ref, expected, rtol=rtol, atol=atol)
+
+    for _ in range(8):
+        out = runner(inp0, inp1)
+        assert torch.equal(out, ref), "TN direct-input matmul is non-deterministic (suspect a cross-tile race)"
     builder.cleanup()
 
 

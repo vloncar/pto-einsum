@@ -712,6 +712,45 @@ passed / 2 skipped**, no regressions.
 
 ---
 
+## 2.13 TN direct input (transposed-A read on `chunk_h`)
+
+The third read mode, and the input-side mirror that completes the GDN contraction set.
+`chunk_h`'s `kv` (`bvhd,bvhe->bhde`, contract `v`) has the contraction as the **outer
+(strided)** axis on *both* operands and the free dim contiguous-inner —
+`C[d,e] = Σᵥ A0[v,d]·A1[v,e] = A0ᵀ @ A1`. §2.11/§2.12 both keep input0 natural (`K`
+innermost); here `K=v` is *not* innermost on input0, so the left operand must be read
+transposed. Because the left operand's contraction is its tile's **inner** axis, a plain
+strided-ND read would need `colStride≠1`; instead — exactly the §2.11 trick applied to A —
+read it via **`Layout::DN`**, making the contiguous free axis `d` the inner read.
+
+- **Read mode** (`in_nt = 3`). A is read transposed via `Layout::DN`: `A_ROW_STRIDE = 1`
+  (free0 `d` contiguous), `A_K_STRIDE = in0_k_stride` (contraction `v` strided by `H·Dᵈ`),
+  with the flipped Mat-tile orientation (`BLayout::RowMajor`, `SLayout::ColMajor`) the way
+  NT flips B. B is the §2.12 NN-strided read (free1 `e` innermost, `K=v` strided) — `in_nt==3`
+  drives `NtIn::dn=false`, so the B side reuses the NN-strided branch verbatim. Verified
+  standalone (`scratchpad/tn_proto.cpp`): the **left-operand** DN read is bit-exact (NT
+  proved the right-operand DN read; §2.12 the strided right operand).
+- **Threaded** through the same `NT_IN` param. The new device branch mirrors B exactly:
+  `A_K_STRIDE = NT_IN ? in0_k_stride : 1`, `A_LAYOUT/A_BLAYOUT/A_SLAYOUT` key off
+  `A_TN = NT_IN && NtIn::tn`, and the within-tile chunk offset becomes
+  `aChunk = aBase + k0·A_K_STRIDE` (provably equal to the old `aBase + k0` for the
+  contiguous-`K` modes). `A_ROW_STRIDE = in0_row_stride` and `in0_k_stride` both fall out
+  of the generic stride formulas (`1` / `1` for the natural modes), so modes 1–2 are
+  unchanged. Eligibility adds `a_transposed = in0[-1]==free0` paired with the existing
+  `b_nn`; all `[0]` indexing is guarded by `single_axes` (a one-line guard that the
+  regression suite caught — the degenerate `i,i->` / `ij,j->i` shapes have empty free lists).
+
+**Perf** (production einsum, `chunk_h` `bvhd,bvhe->bhde`, fp32, on vs off vs torch):
+**3.2–3.8× faster than the prior Phase-A path** and **1.9–2.2× faster than torch**
+(16×16 58 vs 191 vs 111 µs; 64×16 363 vs 1365 vs 792 µs; 16×48 308 vs 988 vs 609 µs).
+**Bit-exact** (fp32 rel=0, fp16 in tol); `test_einsum` adds TN correctness cases +
+`test_tn_strided_input_deterministic` (`in_nt==3`, 8× `torch.equal`); full suite **183
+passed / 2 skipped**, no regressions. All three direct-read shapes are now also exercised
+by the **base** benchmark (`benchmarks/base/bench_einsum.py`: `gdn-kkt-nt`,
+`gdn-wy-fast-nn`, `gdn-chunk-h-tn`), not just the `complex/gdn` example.
+
+---
+
 ## Build cache caveat
 
 The build cache key is an MD5 of the **generated `.cpp`** (the config structs and
@@ -721,17 +760,17 @@ stale `.so` is reused and the change appears to have no effect.
 
 ## Roadmap
 
-- **Direct-input matmul — LANDED (§2.11 NT + §2.12 NN-strided).** All three GDN
+- **Direct-input matmul — LANDED (§2.11 NT + §2.12 NN-strided + §2.13 TN).** All GDN
   contraction shapes now read both operands straight from the raw tensors, dropping
-  Phase A: `kkt`/`chunk_o-qk` via the NT (DN-transposed) read (**2.0–2.2× vs torch**,
-  3.4–3.8× vs Phase A), and `wy_fast`/`chunk_o-intra`/`chunk_o-inter` via the NN-strided
-  (strided-`K` ND) read (**1.5–2.2× vs torch**, 3.5–4.9× vs Phase A). Bit-exact, no
-  regressions. Residual per-stage launch overhead is now the next GDN lever — a
+  Phase A: `kkt`/`chunk_o-qk` via NT (DN-transposed B, **2.0–2.2× vs torch**, 3.4–3.8× vs
+  Phase A); `wy_fast`/`chunk_o-intra`/`chunk_o-inter` via NN-strided (strided-`K` ND B,
+  **1.5–2.2× vs torch**, 3.5–4.9× vs Phase A); `chunk_h-kv` via TN (DN-transposed A,
+  **1.9–2.2× vs torch**, 3.2–3.8× vs Phase A). Bit-exact, no regressions; all three are
+  exercised by the base benchmark (`gdn-kkt-nt`/`gdn-wy-fast-nn`/`gdn-chunk-h-tn`), not
+  just `complex/gdn`. Residual per-stage launch overhead is now the next GDN lever — a
   **graph-capture** target (dispatch-elim, ~2.4× at launch-bound small-`T`). Remaining
-  direct-read follow-ons: the `chunk_h` `bvhd,bvhe->bhde` matmul (contraction *not*
-  innermost on input0 → a transposed-**A** "TN" read, `Layout::DN` on A); multi-axis
-  free dims (only single-axis `free0`/`free1` are eligible today); multi-axis contiguous
-  contraction.
+  direct-read follow-ons: multi-axis free dims (only single-axis `free0`/`free1` are
+  eligible today) and a multi-axis contiguous contraction block.
 - Lift the N-D batched-`TTRANS` `srcColStride==1` requirement (source whose
   second-innermost output axis is non-contiguous) — needs a non-contiguous gather,
   not a single strided DMA.

@@ -37,7 +37,7 @@ _NO_FUSE = dict(
 # Neutral NT strided-input fields (non-NT default). The matmul path overrides these
 # when the contraction is innermost+contiguous on both inputs (see parse_recipe).
 _NO_NT = dict(
-    in_nt=0, in_n_batch=0, in0_row_stride=0, in1_col_stride=0, in1_k_stride=0,
+    in_nt=0, in_n_batch=0, in0_row_stride=0, in0_k_stride=0, in1_col_stride=0, in1_k_stride=0,
     in_batch_sizes=(), in0_batch_strides=(), in1_batch_strides=(),
 )
 
@@ -92,12 +92,17 @@ class EinsumRecipe(TypedDict):
     #           (B_K_STRIDE=1, B_N_STRIDE=in1_col_stride).
     #   2 = NN-strided: free1 innermost on input1 -> B read as Layout::ND with a STRIDED
     #           K row (B_K_STRIDE=in1_k_stride, the head-interleaved stride; B_N_STRIDE=1).
-    # in0_row_stride / in1_col_stride are the source strides of free0 / free1; in1_k_stride
-    # is input1's contraction stride (NN-strided only). The batch arrays decode the flat
-    # batch index into each operand's source base. Neutral (in_nt=0) when not eligible.
+    #   3 = TN: contraction NOT innermost on input0 (free0 is) -> A read transposed via
+    #           Layout::DN (free0 contiguous, contraction strided by in0_k_stride); B is
+    #           read NN-strided (free1 innermost on input1), as mode 2.
+    # in0_row_stride / in1_col_stride are the source strides of free0 / free1; in0_k_stride
+    # / in1_k_stride are input0 / input1's contraction strides (1 unless that operand is
+    # read with a strided contraction). The batch arrays decode the flat batch index into
+    # each operand's source base. Neutral (in_nt=0) when not eligible.
     in_nt: int
     in_n_batch: int
     in0_row_stride: int
+    in0_k_stride: int
     in1_col_stride: int
     in1_k_stride: int
     in_batch_sizes: tuple
@@ -290,7 +295,9 @@ class EinsumBuilder:
         #       DN read (the flash Q@K^T pattern).
         #   NN-strided (mode 2): free1 innermost on input1 -> B read as ND with a STRIDED
         #       K row (an interleaved head axis sits between K and N, e.g. bjhd's j).
-        # Both require a 16-aligned contraction (K==C, so no contraction pad) and full
+        #   TN (mode 3): contraction NOT innermost on input0 (free0 is) -> A read
+        #       transposed via DN (free0 contiguous, contraction strided); B NN-strided.
+        # All require a 16-aligned contraction (K==C, so no contraction pad) and full
         # output tiles (free dims tile-aligned, so no zero-pad row/col the strided read
         # cannot synthesize). Composes with the fused output store above.
         single_axes = (
@@ -298,10 +305,15 @@ class EinsumBuilder:
             and len(contract) == 1 and len(invariant0) == 1 and len(invariant1) == 1
             and contract_size % 16 == 0
         )
+        # single_axes guards every [0] index below (it requires len == 1 for each axis
+        # list, so contract[0] / invariant0[0] / invariant1[0] are all in range).
         a_natural = single_axes and in0[-1] == contract[0]
+        a_transposed = single_axes and in0[-1] == invariant0[0]
+        b_nn = single_axes and in1[-1] == invariant1[0]
         nt_mode = a_natural and in1[-1] == contract[0]
-        nn_mode = a_natural and not nt_mode and in1[-1] == invariant1[0]
-        read_direct = nt_mode or nn_mode
+        nn_mode = a_natural and not nt_mode and b_nn
+        tn_mode = a_transposed and b_nn
+        read_direct = nt_mode or nn_mode or tn_mode
         if read_direct:
             pad16 = lambda x: (x + 15) // 16 * 16
             tile = int(os.getenv("EINSUM_TILE_SIZE", "128"))
@@ -320,9 +332,10 @@ class EinsumBuilder:
             st0 = _row_strides(input_shape0)
             st1 = _row_strides(input_shape1)
             nt_fields = dict(
-                in_nt=1 if nt_mode else 2,
+                in_nt=1 if nt_mode else (2 if nn_mode else 3),
                 in_n_batch=len(inplace),
                 in0_row_stride=int(st0[in0.index(invariant0[0])]),
+                in0_k_stride=int(st0[in0.index(contract[0])]),
                 in1_col_stride=int(st1[in1.index(invariant1[0])]),
                 in1_k_stride=int(st1[in1.index(contract[0])]),
                 in_batch_sizes=tuple(int(s) for s in inplace_shape),
@@ -530,6 +543,7 @@ class EinsumBuilder:
             in_nt=self.recipe['in_nt'],
             in_n_batch=self.recipe['in_n_batch'],
             in0_row_stride=self.recipe['in0_row_stride'],
+            in0_k_stride=self.recipe['in0_k_stride'],
             in1_col_stride=self.recipe['in1_col_stride'],
             in1_k_stride=self.recipe['in1_k_stride'],
             NIB=len(in_batch_sizes),
