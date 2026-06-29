@@ -364,6 +364,39 @@ def test_tn_strided_input_deterministic(dtype):
     builder.cleanup()
 
 
+@pytest.mark.parametrize("equation, shape0, shape1, expect_fusible", [
+    # Fusible: free0/free1 each a single axis and free1 is the innermost output axis,
+    # so the Cube stores each tile straight into res (§2.9) -- Phase C dropped.
+    ("bshd, bthd -> bsht", (2, 128, 4, 64), (2, 128, 4, 64), 1),   # attention scores
+    ("bihd, bjhd -> bihj", (4, 128, 4, 128), (4, 128, 4, 128), 1), # GDN kkt (composes with NT)
+    # Non-fusible: identity output (its own fast path) and a transposed output whose
+    # innermost axis is free0 (free1 not innermost) -- both keep out_fusible = 0.
+    ("ij, jk -> ik", (32, 64), (64, 128), 0),  # identity output
+    ("ij, jk -> ki", (32, 64), (64, 48), 0),   # transposed output (free1 not innermost)
+])
+def test_fused_output_gate(equation, shape0, shape1, expect_fusible):
+    # Proven-teeth gate for the fused output store (§2.9), the analogue of the
+    # `in_nt = N` read-mode gates above: assert the generated config actually selects
+    # (or rejects) the fused store, so a codegen change that silently drops a fusible
+    # output back onto the slower Phase C path -- still *correct*, so the correctness
+    # cases would not catch it -- fails loudly here. Also pins correctness on each case.
+    if TEST_DEVICE != "npu":
+        pytest.skip("fused output store is an NPU codegen path")
+
+    builder = EinsumBuilder(equation, [shape0, shape1], torch.float32, device=TEST_DEVICE)
+    runner = builder.build()
+    assert f"out_fusible = {expect_fusible}" in builder.cpp_code, (
+        f"{equation}: expected out_fusible = {expect_fusible} "
+        f"(fused store {'should' if expect_fusible else 'should NOT'} fire)")
+
+    inp0 = torch.rand(shape0, dtype=torch.float32, device=TEST_DEVICE)
+    inp1 = torch.rand(shape1, dtype=torch.float32, device=TEST_DEVICE)
+    result = runner(inp0, inp1)
+    expected = torch.einsum(equation, inp0, inp1).to(dtype=torch.float32)
+    torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+    builder.cleanup()
+
+
 def test_validation_errors():
     equation = "ij, jk -> ik"
     shape0 = (32, 64)

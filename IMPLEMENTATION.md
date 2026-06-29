@@ -23,6 +23,43 @@ encode the kernels with the Huawei PTO-ISA (built on Ascend C).
 
 ---
 
+## Public API & stability (soft freeze)
+
+`pto-einsum` is the **soft-frozen contraction substrate**. Graph-level work — fusing
+stages, scheduling sequences, dispatch-elimination — lives one layer up in
+[`pto-fuser`](../pto-fuser), which consumes this package as a pinned dependency. The
+soft freeze means: the substrate's job is to compile *one* contraction well, the
+public surface below is stable, and changes to it are *demand-driven and deliberate*
+(a real, measured target with a test), not speculative.
+
+**Public surface (stable):**
+
+- `einsum(equation, op0, op1, *, device=...) -> Tensor` — the two-operand entry
+  point. Same call shape as `torch.einsum` for the supported equation class;
+  unsupported equations raise a clean `ValueError` (they are not silently
+  miscomputed).
+- `EinsumBuilder` with the persistent-workspace lifecycle (`setup` / `exec` /
+  `teardown`, §2.1) for repeated dispatch of a fixed equation+shape.
+- The supported equation class: two operands, batch + free + contraction axes, the
+  elementwise (Hadamard, §1.3) and broadcast/scaling (§1.4) paths. Read modes
+  (NN / NT / NN-strided / TN) and fused-output stores are **internal optimizations
+  chosen by the builder** from the equation and layouts — not part of the public
+  call; callers do not request them.
+
+**Internal (may change, behind the public surface):** everything in `pto_einsum.h`
+(tile sizes, pipeline depth, the Phase A/B/C kernels, split-K), the codegen
+templates, and the read-mode/fused-store selection heuristics. Optimizations in
+Part 2 refine *how* a contraction is computed; none change *what* `einsum()` returns
+for a supported equation.
+
+**Change policy:** new substrate capability is added only when a concrete consumer
+(typically a `pto-fuser` lever) needs it, with a benchmark/target motivating it and
+test coverage gating it; new behavior lands behind a default-off flag so the frozen
+path is unchanged until proven. Equation-class extensions must keep the
+"reject-cleanly-or-compute-correctly" invariant — never silently drop an axis.
+
+---
+
 # Part 1 — The core algorithm
 
 This part describes the baseline transpose → matmul → transpose pipeline as if no
@@ -760,17 +797,9 @@ stale `.so` is reused and the change appears to have no effect.
 
 ## Roadmap
 
-- **Direct-input matmul — LANDED (§2.11 NT + §2.12 NN-strided + §2.13 TN).** All GDN
-  contraction shapes now read both operands straight from the raw tensors, dropping
-  Phase A: `kkt`/`chunk_o-qk` via NT (DN-transposed B, **2.0–2.2× vs torch**, 3.4–3.8× vs
-  Phase A); `wy_fast`/`chunk_o-intra`/`chunk_o-inter` via NN-strided (strided-`K` ND B,
-  **1.5–2.2× vs torch**, 3.5–4.9× vs Phase A); `chunk_h-kv` via TN (DN-transposed A,
-  **1.9–2.2× vs torch**, 3.2–3.8× vs Phase A). Bit-exact, no regressions; all three are
-  exercised by the base benchmark (`gdn-kkt-nt`/`gdn-wy-fast-nn`/`gdn-chunk-h-tn`), not
-  just `complex/gdn`. Residual per-stage launch overhead is now the next GDN lever — a
-  **graph-capture** target (dispatch-elim, ~2.4× at launch-bound small-`T`). Remaining
-  direct-read follow-ons: multi-axis free dims (only single-axis `free0`/`free1` are
-  eligible today) and a multi-axis contiguous contraction block.
+- Direct-read follow-ons (the §2.11–§2.13 NT/NN-strided/TN modes are limited to
+  single-axis `free0`/`free1` and a single contiguous contraction axis today):
+  multi-axis free dims and a multi-axis contiguous contraction block.
 - Lift the N-D batched-`TTRANS` `srcColStride==1` requirement (source whose
   second-innermost output axis is non-contiguous) — needs a non-contiguous gather,
   not a single strided DMA.
@@ -794,36 +823,3 @@ stale `.so` is reused and the change appears to have no effect.
   output (`free1` *not* innermost) still runs Phase C — the strided-col fixpipe store is
   unverified — and split-K (§2.6) could be extended to atomic-add into the permuted
   window (it stays gated on `OUT_IDENTITY` for now).
-- **Distributed (multi-NPU) einsum — overlapped ring/context-parallel attention only;
-  *not* a general distributed einsum.** *Context:* PTO-ISA ships a complete inter-NPU
-  set on a2a3 (910B/910C) under `include/pto/comm/`: one-sided `TPUT`/`TGET` plus
-  **`TPUT_ASYNC`/`TGET_ASYNC` over SDMA** (with a separate `AsyncEvent::Wait`), signals
-  (`TNOTIFY`/`TWAIT`/`TTEST`), and collectives (`TGATHER`/`TSCATTER`/`TBROADCAST`/
-  `TREDUCE`) over a `ParallelGroup`. So feasibility is not the blocker. *Why most of it
-  is not worth building:* in an LLM stack, distribution is orchestrated one level up —
-  the framework + HCCL insert collectives *between* kernels (DP grad all-reduce, TP
-  all-reduce/all-gather around projections, PP send/recv, MoE all-to-all). Re-doing any
-  of that inside a two-operand einsum buys nothing over HCCL. In-kernel communication
-  only wins where the comm↔compute overlap is *algorithm-intrinsic* and a framework
-  barrier would force serialization. *The one target that qualifies:* **ring /
-  context-parallel attention** — shard the sequence across N ranks, compute local
-  attention on block `i` while `TGET_ASYNC`-ing rank `i+1`'s K/V block around the ring
-  and accumulating online-softmax-style. It is our existing attention contraction with a
-  comm ring wrapped around the K-loop; the cross-device KV transfer is large and genuinely
-  hideable behind attention compute, so unlike the Phase-overlap case (rejected, ≤10 %
-  ceiling — see "Fused output permutation") the overlap ceiling here is high. It also
-  unlocks long-context, extending the arbitrary-seqlen / partial-tile direction. *Two
-  hard gates before any code (Plan-0 discipline):* (1) **confirm hardware** — ≥2 NPUs in
-  a reachable `ParallelGroup` on the dev box; single-die ⇒ dead on arrival; (2)
-  **measure the ratio** — a small `TGET_ASYNC` round-trip microbench (KV-block transfer
-  time vs. per-block attention compute) at a couple of seqlens; if transfer ≫ compute
-  even fully overlapped, it is bandwidth-bound and the ring buys little; if comparable,
-  the ceiling is large and it is go. *Scope/risk:* research-scale (online-softmax
-  accumulation + ring scheduling + async-event plumbing + a multi-rank launch/golden
-  harness), and cross-*device* `TNOTIFY`/`TWAIT` ordering is far less forgiving than the
-  cross-core FFTS barriers used today. Tensor-parallel matmul + reduce-scatter/all-gather
-  fusion (Flux/Megatron-style, via `TPUT_ASYNC` into the collective) is a possible
-  follow-on but partially overlaps what HCCL already delivers — lower marginal value, not
-  the entry point. Note this is orthogonal to the single-node bottleneck: distribution
-  does not touch Phase C, so "Fused output permutation" above remains the higher-certainty
-  next win.

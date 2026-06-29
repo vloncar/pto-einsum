@@ -163,19 +163,24 @@ pto-einsum/
 
 ```bash
 export PTO_LIB_PATH=/path/to/pto-isa
-pytest tests/                       # whole suite
+pytest                              # whole suite (testpaths=tests is configured)
 ```
 
-The suite is split by scope:
+A bare `pytest` from the repo root is the single entry point — `testpaths` in
+`pyproject.toml` collects every module under `tests/`. The suite is split by scope:
 
 - `test_transpose.py` / `test_matmul.py` — **components**: the standalone transpose
   and Cube-matmul kernels, checked against the pure-Python reference (`reference.py`).
 - `test_einsum.py` — **base**: general end-to-end einsum correctness, with cases
   grouped by the kernel path they exercise (identity/transposed/blocked layouts,
   non-identity output, batched, `K!=C`, elementwise, degenerate free dims, split-K,
-  partial tiles), plus builder reuse, input validation and cleanup. Known-unsupported
-  equations are kept as `skip`s (with their loud-failure contract pinned) so they
-  flip to real checks once a path lands.
+  partial tiles), plus builder reuse, input validation and cleanup. It also carries
+  the **codegen gates** — proven-teeth self-tests that assert the generated config
+  actually selects the intended path (`in_nt = N` read modes, `out_fusible = N`
+  fused store) so a silent regression onto a slower-but-correct path fails loudly —
+  and the **determinism guards** (bit-exact across repeated runs) for the pipelined
+  and direct-input Cube paths. Known-unsupported equations are kept as `skip`s (with
+  their loud-failure contract pinned) so they flip to real checks once a path lands.
 - `test_llm_ops.py` — **LLM**: multi-batch-axis attention contractions, the
   linear-attention chain, and broadcast/scaling ops.
 

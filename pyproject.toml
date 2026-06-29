@@ -5,3 +5,12 @@ build-backend = "setuptools.build_meta"
 # Project metadata and packaging options are declared in setup.cfg (declarative
 # config). This keeps the package installable across a wide range of setuptools
 # versions, including older toolchains shipped inside CANN containers.
+
+# Single entry point for the test suite: bare `pytest` (from the repo root)
+# collects and runs every test module under tests/. The suite targets the NPU by
+# default; override with EINSUM_TEST_DEVICE=cpu for the CPU-buildable subset.
+# Requires PTO_LIB_PATH (pto-isa install root) and ASCEND_HOME_PATH to be set; the
+# builder raises a clear error if PTO_LIB_PATH is missing.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
