@@ -380,9 +380,18 @@ static_assert(!MatmulPipeline<float, Cfg<200, 128, 128, 64, 128>>::PIPELINE_TILE
 //      GM->L1 load under chunk c's compute.
 // Each tile is self-contained (inits its event flags, drains them before the
 // store), so the scheduler can hand tiles to cores in any order.
-template <typename data_T, typename CONFIG_T, bool FUSE_OUT = false, bool NT_IN = false>
+// EXT_STORE (default off): when set, the produced tile is stored to the caller-
+// supplied `ext_dst` ([validM,validN], row stride L1) instead of its natural
+// `i*L0*L1` position in `ws_res`. This is the reusable "produce one tile to a
+// caller-chosen GM slot" hook: it decouples tile *placement* from the tile index so
+// a fused driver can land each tile in a small cross-core ring buffer (an on-chip /
+// L2-resident handoff to a Vec epilogue) rather than a full I*L0*L1 materialization.
+// Off by default -> every existing caller is byte-for-byte unchanged.
+template <typename data_T, typename CONFIG_T, bool FUSE_OUT = false, bool NT_IN = false,
+          bool EXT_STORE = false>
 AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const data_T* ws1,
-                                        __gm__ float* ws_res, unsigned t) {
+                                        __gm__ float* ws_res, unsigned t,
+                                        __gm__ float* ext_dst = nullptr) {
         using G = MatmulGeom<CONFIG_T>;
         constexpr unsigned L0 = G::L0;
         constexpr unsigned L1 = G::L1;
@@ -606,19 +615,25 @@ AICORE inline void matmul_one_tile_deep(__gm__ const data_T* ws0, __gm__ const d
         // layout: i*L0*L1 + row0*L1 + col0. Fused: decode the flat batch index `i`
         // row-major over the inplace axes into a res base (Σ idx_k·res_stride_k), then
         // add row0·ROW_STRIDE + col0 (free1 innermost -> unit col stride).
-        unsigned base;
-        if constexpr (FUSE_OUT) {
-            base = row0 * ROW_STRIDE + col0;
-            unsigned rem = i;
-            #pragma unroll
-            for (int k = int(FOut::n_batch) - 1; k >= 0; --k) {
-                base += (rem % CONFIG_T::out_batch_sizes[k]) * CONFIG_T::out_batch_strides[k];
-                rem /= CONFIG_T::out_batch_sizes[k];
-            }
+        __gm__ float* cdst;
+        if constexpr (EXT_STORE) {
+            cdst = ext_dst;                       // caller-chosen ring slot
         } else {
-            base = i * L0 * L1 + row0 * L1 + col0;
+            unsigned base;
+            if constexpr (FUSE_OUT) {
+                base = row0 * ROW_STRIDE + col0;
+                unsigned rem = i;
+                #pragma unroll
+                for (int k = int(FOut::n_batch) - 1; k >= 0; --k) {
+                    base += (rem % CONFIG_T::out_batch_sizes[k]) * CONFIG_T::out_batch_strides[k];
+                    rem /= CONFIG_T::out_batch_sizes[k];
+                }
+            } else {
+                base = i * L0 * L1 + row0 * L1 + col0;
+            }
+            cdst = ws_res + base;
         }
-        pto::GlobalTensor<float, ShapeC, StrideC> cg(ws_res + base, ShapeC(validM, validN));
+        pto::GlobalTensor<float, ShapeC, StrideC> cg(cdst, ShapeC(validM, validN));
         TSTORE(cg, c_l0);
         set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
         wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
