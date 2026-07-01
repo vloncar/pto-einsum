@@ -68,7 +68,10 @@ class MegaKDA:
         # stage that writes only the valid region never exposes freed-memory garbage
         # to the next stage — otherwise results go nondeterministic across runs).
         T, HV_ = self.T, self.HV
-        self.g_sum = torch.zeros(1, T, HV_, D, device=self.dev, dtype=torch.float16)
+        # g_sum is fp32: the upstream gate-cumsum + all downstream KDA kernels
+        # (kkt/wy/chunk_h/chunk_o) now require the cumulative gate in float32 (the
+        # precision fix for the gate path); every one asserts g_cs.dtype == float32.
+        self.g_sum = torch.zeros(1, T, HV_, D, device=self.dev, dtype=torch.float32)
         self.L = torch.zeros(1, T, HV_, C, device=self.dev, dtype=torch.float16)
         self.A_inv = torch.zeros(1, T, HV_, C, device=self.dev, dtype=torch.float16)
         self.u = torch.zeros(1, T, HV_, D, device=self.dev, dtype=torch.float16)
